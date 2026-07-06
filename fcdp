@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""fcdp - Full Chrome DevTools Protocol from the CLI, via our OWN MV3 extension.
+
+ONE tool for everything on your REAL Default profile: everyday driving
+(open/nav/read/find/click/type/fill/key/scroll/shot/wait/js/text) AND the four
+advanced domains ccb cannot do (pdf/intercept/throttle/trace) — all through
+chrome.debugger.sendCommand, which accepts ANY CDP method.
+
+tabId is OPTIONAL on every command: `fcdp open <url>` caches the new tab in
+~/.cache/fcdp-tab; omit tabId to use it, or pass it explicitly as the first arg.
+
+Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
+  request : {id, tabId, method, params}   or  {op:"subscribe", filter, tabId}
+  reply   : {id, result|error}            events pushed as {event, tabId, params}
+"""
+import socket, struct, json, sys, os, base64, time, select, re
+
+SOCK = "/tmp/fcdp.sock"
+CACHE = os.path.expanduser("~/.cache/fcdp-tab")
+
+
+class Conn:
+    """One persistent Unix-socket connection to the bridge. Demuxes command
+    replies (have `id`) from CDP events (have `event`)."""
+    def __init__(self, timeout=120):
+        if not os.path.exists(SOCK):
+            die("bridge socket %s not found — is the fcdp bridge running? (launchctl list | grep fcdp)" % SOCK)
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(timeout)
+        try:
+            self.s.connect(SOCK)
+        except Exception as e:
+            die("could not connect to bridge at %s (%s)" % (SOCK, e))
+        self.buf = b""
+        self.evq = []
+        self._id = 0
+
+    def _next(self):
+        self._id += 1
+        return self._id
+
+    def _send(self, obj):
+        body = json.dumps(obj).encode()
+        self.s.sendall(struct.pack("<I", len(body)) + body)
+
+    def _read_one(self):
+        while True:
+            if len(self.buf) >= 4:
+                n = struct.unpack("<I", self.buf[:4])[0]
+                if len(self.buf) >= 4 + n:
+                    frame = self.buf[4:4 + n]
+                    self.buf = self.buf[4 + n:]
+                    return json.loads(frame.decode("utf-8", "replace"))
+            d = self.s.recv(65536)
+            if not d:
+                return None
+            self.buf += d
+
+    def cmd(self, tabId, method, params=None):
+        cid = self._next()
+        self._send({"id": cid, "tabId": tabId, "method": method, "params": params or {}})
+        while True:
+            f = self._read_one()
+            if f is None:
+                return {"error": {"message": "connection closed"}}
+            if f.get("id") == cid:
+                return f
+            if f.get("event"):
+                self.evq.append(f)
+
+    def send_only(self, tabId, method, params=None):
+        cid = self._next()
+        self._send({"id": cid, "tabId": tabId, "method": method, "params": params or {}})
+
+    def subscribe(self, filter=None, tabId=None):
+        self._send({"op": "subscribe", "filter": filter or [], "tabId": tabId})
+        return self._read_one()
+
+    def collect(self, seconds, on_event=None):
+        events = []
+        for f in self.evq:
+            events.append(f)
+            if on_event:
+                on_event(f)
+        self.evq = []
+        end = time.time() + seconds
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([self.s], [], [], remaining)
+            if not r:
+                break
+            d = self.s.recv(65536)
+            if not d:
+                break
+            self.buf += d
+            while len(self.buf) >= 4:
+                n = struct.unpack("<I", self.buf[:4])[0]
+                if len(self.buf) < 4 + n:
+                    break
+                obj = json.loads(self.buf[4:4 + n].decode("utf-8", "replace"))
+                self.buf = self.buf[4 + n:]
+                if obj.get("event"):
+                    events.append(obj)
+                    if on_event:
+                        on_event(obj)
+        return events
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+def die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def show(r):
+    print(json.dumps(r, indent=2)[:8000])
+
+
+def result_or_die(r, what):
+    if isinstance(r, dict) and r.get("error"):
+        die("%s failed: %s" % (what, r["error"].get("message")))
+    return r.get("result", {}) if isinstance(r, dict) else r
+
+
+# ---- tab cache so tabId is optional on every command --------------------------
+def save_tab(tid):
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        open(CACHE, "w").write(str(tid))
+    except Exception:
+        pass
+
+
+def cached_tab():
+    try:
+        return int(open(CACHE).read().strip())
+    except Exception:
+        return None
+
+
+def resolve_tid(a, idx):
+    """Return (tabId, remaining_args). Uses a[idx] if it's an int, else the cached tab."""
+    if len(a) > idx and re.fullmatch(r"\d+", a[idx]):
+        return int(a[idx]), a[idx + 1:]
+    t = cached_tab()
+    if t is None:
+        die("no tabId given and none cached — run `fcdp open <url>` first, or pass a tabId")
+    return t, a[idx:]
+
+
+def evalv(conn, tid, expr):
+    r = conn.cmd(tid, "Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True})
+    res = result_or_die(r, "Runtime.evaluate")
+    return res.get("result", {}).get("value")
+
+
+def click_at(conn, tid, x, y):
+    for typ in ("mousePressed", "mouseReleased"):
+        conn.cmd(tid, "Input.dispatchMouseEvent",
+                 {"type": typ, "x": int(x), "y": int(y), "button": "left", "clickCount": 1})
+
+
+KEYS = {
+    "Enter": ("Enter", "Enter", 13, "\r"), "Return": ("Enter", "Enter", 13, "\r"),
+    "Tab": ("Tab", "Tab", 9, None), "Escape": ("Escape", "Escape", 27, None), "Esc": ("Escape", "Escape", 27, None),
+    "Backspace": ("Backspace", "Backspace", 8, None), "Delete": ("Delete", "Delete", 46, None),
+    "ArrowUp": ("ArrowUp", "ArrowUp", 38, None), "ArrowDown": ("ArrowDown", "ArrowDown", 40, None),
+    "ArrowLeft": ("ArrowLeft", "ArrowLeft", 37, None), "ArrowRight": ("ArrowRight", "ArrowRight", 39, None),
+    "Space": (" ", "Space", 32, " "),
+}
+
+
+def press_key(conn, tid, name):
+    k = KEYS.get(name) or KEYS.get(name.capitalize())
+    if not k:
+        die("unknown key: %s (known: %s)" % (name, ", ".join(sorted(KEYS))))
+    key, code, vk, text = k
+    down = {"type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    if text:
+        down["text"] = text
+    conn.cmd(tid, "Input.dispatchKeyEvent", down)
+    conn.cmd(tid, "Input.dispatchKeyEvent",
+             {"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+
+
+HELP = """fcdp - ONE CLI for your REAL Chrome (our MV3 extension via chrome.debugger)
+
+TABS / NAV:
+  fcdp tabs                       list tabs -> tabId,url,title
+  fcdp open <url> [--bg]          open a NEW tab (cached as active); --bg = background
+  fcdp nav [tab] <url>            navigate the tab
+  fcdp close [tab]                close the tab
+
+READ:
+  fcdp read [tab]                 interactive-element outline (role/text/coords) + title/url
+  fcdp text [tab]                 page innerText
+  fcdp find [tab] "<css|text>"    matching elements -> tag,text,center x,y
+  fcdp shot [tab] [file.png]      screenshot (Page.captureScreenshot)
+
+INTERACT:
+  fcdp click [tab] <css|text|x,y> click an element (by selector/visible-text) or coords
+  fcdp type [tab] "<text>"        type at the focused element (Input.insertText)
+  fcdp fill [tab] <css> "<value>" set an input's value (React-safe) by selector
+  fcdp key  [tab] <Key>           press a key (Enter, Tab, Escape, ArrowDown, ...)
+  fcdp scroll [tab] <up|down|left|right> [n]
+  fcdp js  [tab] "<code>"         Runtime.evaluate (returnByValue, awaitPromise)
+  fcdp wait [tab] "<jsExpr>" [ms] poll until truthy
+
+FULL-CDP POWER (the 4 domains ccb CANNOT do):
+  fcdp pdf [tab] [out.pdf]        Page.printToPDF -> real PDF
+  fcdp intercept [tab] [secs]     Fetch.enable + reload; log & continue paused requests
+  fcdp throttle [tab]             Network.emulateNetworkConditions Slow-3G
+  fcdp trace [tab] [out.json]     Tracing.start/end -> trace file
+  fcdp raw [tab] <CDP.Method> ['<json>']   any CDP call
+  fcdp attach|detach [tab]
+
+tabId is optional everywhere (omit to use the last `fcdp open`ed tab).
+"""
+
+# JS snippets (SEL / VAL substituted with json.dumps'd literals)
+_FIND = r"""(function(sel){var els=[];try{els=Array.prototype.slice.call(document.querySelectorAll(sel));}catch(e){els=[];}
+if(!els.length){var all=document.querySelectorAll('a,button,input,select,textarea,[role],summary,label');
+for(var i=0;i<all.length;i++){var t=(all[i].textContent||all[i].value||'').trim();if(t&&t.toLowerCase().indexOf(String(sel).toLowerCase())>-1)els.push(all[i]);}}
+return els.slice(0,25).map(function(el){var r=el.getBoundingClientRect();return {tag:el.tagName,text:(el.textContent||el.value||'').trim().slice(0,60),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height)};});})"""
+
+_CENTER = r"""(function(sel){var el=null;try{el=document.querySelector(sel);}catch(e){}
+if(!el){var cand=document.querySelectorAll('a,button,[role=button],[role=link],[role=tab],[role=menuitem],input,select,textarea,summary,label,[onclick]');
+var q=String(sel).toLowerCase(),best=null,bestLen=1e9;
+for(var i=0;i<cand.length;i++){var t=(cand[i].getAttribute('aria-label')||cand[i].textContent||cand[i].value||'').trim();
+if(t&&t.toLowerCase().indexOf(q)>-1&&t.length<bestLen){best=cand[i];bestLen=t.length;}}el=best;}
+if(!el)return null;el.scrollIntoView({block:'center'});var r=el.getBoundingClientRect();
+return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),tag:el.tagName,text:(el.textContent||el.value||'').trim().slice(0,50)};})"""
+
+_FILL = r"""(function(sel,val){var el=document.querySelector(sel);if(!el)return {ok:false,err:'not found: '+sel};
+el.focus();var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+var setter=Object.getOwnPropertyDescriptor(proto,'value').set;setter.call(el,val);
+el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));
+return {ok:true,value:el.value};})"""
+
+_READ = r"""(function(){var all=document.querySelectorAll('a,button,input,select,textarea,[role],summary,[onclick]');var out=[];
+for(var i=0;i<all.length&&out.length<80;i++){var el=all[i];var r=el.getBoundingClientRect();if(r.width===0||r.height===0)continue;
+var t=(el.getAttribute('aria-label')||el.textContent||el.value||el.placeholder||'').trim().slice(0,60);
+out.push(el.tagName.toLowerCase()+(el.type?('['+el.type+']'):'')+' "'+t+'" @'+Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2));}
+return {title:document.title,url:location.href,interactive:out};})()"""
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    c = a[0]
+
+    if c == "tabs":
+        conn = Conn(); r = conn.cmd(None, "Meta.listTabs"); conn.close()
+        res = result_or_die(r, "Meta.listTabs")
+        for t in res.get("tabs", []):
+            print("%s\t%s\t%s" % (t.get("tabId"), (t.get("url") or "")[:70], (t.get("title") or "")[:40]))
+        if res.get("attached"):
+            print("# attached tabs: %s" % res["attached"], file=sys.stderr)
+        return
+
+    if c == "open":
+        url = None
+        bg = "--bg" in a
+        for x in a[1:]:
+            if x != "--bg":
+                url = x; break
+        url = url or "about:blank"
+        conn = Conn()
+        tabs_before = result_or_die(conn.cmd(None, "Meta.listTabs"), "Meta.listTabs").get("tabs", [])
+        before = {t["tabId"] for t in tabs_before}
+        # Prefer the native chrome.tabs op (active once the extension is reloaded);
+        # else fall back to window.open on an existing tab — pure CDP, no reload needed.
+        r = conn.cmd(None, "Meta.createTab", {"url": url, "active": not bg})
+        tid = r.get("result", {}).get("tabId") if isinstance(r, dict) else None
+        if not tid:
+            # Anchor on a NORMAL page (chrome:// restricts window.open); userGesture beats the popup blocker.
+            anchor = None
+            for t in tabs_before:
+                if (t.get("url") or "").startswith(("http://", "https://", "file:")):
+                    anchor = t["tabId"]; break
+            if anchor is None and tabs_before:
+                anchor = tabs_before[0]["tabId"]
+            if anchor is None:
+                conn.close(); die("no tab to anchor window.open — open any http page in Chrome first")
+            conn.cmd(anchor, "Runtime.evaluate",
+                     {"expression": "window.open(%s,'_blank')" % json.dumps(url), "userGesture": True})
+            time.sleep(0.8)
+            after = result_or_die(conn.cmd(None, "Meta.listTabs"), "Meta.listTabs").get("tabs", [])
+            new = [t for t in after if t["tabId"] not in before]
+            tid = new[0]["tabId"] if new else None
+        conn.close()
+        if not tid:
+            die("could not open a new tab")
+        save_tab(tid)
+        print("tabId %d (cached active)" % tid)
+        return
+
+    if c in ("attach", "detach"):
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); r = conn.cmd(tid, "Meta.attach" if c == "attach" else "Meta.detach"); conn.close()
+        show(r); return
+
+    if c == "close":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn()
+        r = conn.cmd(tid, "Meta.closeTab")
+        if isinstance(r, dict) and r.get("error"):
+            # pre-reload extension has no Meta.closeTab — window.close() (works for script-opened tabs)
+            conn.cmd(tid, "Runtime.evaluate", {"expression": "window.close()"})
+            r = {"result": {"closed": True, "tabId": tid, "via": "window.close"}}
+        conn.close(); show(r); return
+
+    if c == "raw":
+        tid, rest = resolve_tid(a, 1)
+        method = rest[0]; params = json.loads(rest[1]) if len(rest) > 1 else {}
+        conn = Conn(); r = conn.cmd(tid, method, params); conn.close()
+        show(r); return
+
+    if c == "js":
+        tid, rest = resolve_tid(a, 1)
+        code = " ".join(rest)
+        conn = Conn()
+        r = conn.cmd(tid, "Runtime.evaluate", {"expression": code, "returnByValue": True, "awaitPromise": True})
+        conn.close()
+        res = result_or_die(r, "Runtime.evaluate")
+        rv = res.get("result", {})
+        if "value" in rv:
+            print(json.dumps(rv["value"], indent=2) if not isinstance(rv["value"], str) else rv["value"])
+        else:
+            show(res)
+        return
+
+    if c == "nav":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp nav [tab] <url>")
+        conn = Conn(); conn.cmd(tid, "Page.enable")
+        r = conn.cmd(tid, "Page.navigate", {"url": rest[0]}); conn.close()
+        save_tab(tid); show(r); return
+
+    if c == "text":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn()
+        v = evalv(conn, tid, "document.body ? document.body.innerText : ''")
+        conn.close()
+        print((v or "")[:8000]); return
+
+    if c == "read":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); v = evalv(conn, tid, _READ); conn.close()
+        if not isinstance(v, dict):
+            die("read failed: %s" % json.dumps(v)[:300])
+        print("%s\n%s" % (v.get("title"), v.get("url")))
+        for line in v.get("interactive", []):
+            print("  " + line)
+        return
+
+    if c == "find":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die('usage: fcdp find [tab] "<css|text>"')
+        sel = " ".join(rest)
+        conn = Conn(); v = evalv(conn, tid, _FIND + "(" + json.dumps(sel) + ")"); conn.close()
+        print(json.dumps(v, indent=2)); return
+
+    if c == "click":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die('usage: fcdp click [tab] <css|text|x,y>')
+        arg = " ".join(rest)
+        conn = Conn()
+        m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", arg)
+        if m:
+            click_at(conn, tid, int(m.group(1)), int(m.group(2)))
+            conn.close(); print("clicked %s,%s" % (m.group(1), m.group(2))); return
+        ctr = evalv(conn, tid, _CENTER + "(" + json.dumps(arg) + ")")
+        if not ctr:
+            conn.close(); die("no element matched: %s" % arg)
+        click_at(conn, tid, ctr["x"], ctr["y"])
+        conn.close()
+        print("clicked <%s> \"%s\" @%d,%d" % (ctr.get("tag"), ctr.get("text"), ctr["x"], ctr["y"])); return
+
+    if c == "type":
+        tid, rest = resolve_tid(a, 1)
+        conn = Conn(); r = conn.cmd(tid, "Input.insertText", {"text": " ".join(rest)}); conn.close()
+        result_or_die(r, "Input.insertText"); print("typed %d chars" % len(" ".join(rest))); return
+
+    if c == "fill":
+        tid, rest = resolve_tid(a, 1)
+        if len(rest) < 2:
+            die('usage: fcdp fill [tab] <css> "<value>"')
+        sel = rest[0]; val = " ".join(rest[1:])
+        conn = Conn()
+        v = evalv(conn, tid, _FILL + "(" + json.dumps(sel) + "," + json.dumps(val) + ")")
+        conn.close()
+        print(json.dumps(v)); return
+
+    if c == "key":
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp key [tab] <KeyName>")
+        conn = Conn(); press_key(conn, tid, rest[0]); conn.close()
+        print("pressed %s" % rest[0]); return
+
+    if c == "scroll":
+        tid, rest = resolve_tid(a, 1)
+        direction = rest[0] if rest else "down"
+        n = int(rest[1]) if len(rest) > 1 else 3
+        dx, dy = 0, 0
+        step = 400 * n
+        if direction == "down": dy = step
+        elif direction == "up": dy = -step
+        elif direction == "right": dx = step
+        elif direction == "left": dx = -step
+        conn = Conn(); evalv(conn, tid, "window.scrollBy(%d,%d); [scrollX,scrollY]" % (dx, dy)); conn.close()
+        print("scrolled %s %d" % (direction, n)); return
+
+    if c in ("shot", "screenshot"):
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else os.path.expanduser("~/Downloads/fcdp-shot.png")
+        conn = Conn()
+        r = conn.cmd(tid, "Page.captureScreenshot", {"format": "png"}); conn.close()
+        res = result_or_die(r, "Page.captureScreenshot")
+        data = res.get("data")
+        if not data:
+            die("no screenshot data")
+        open(out, "wb").write(base64.b64decode(data))
+        print("wrote %s" % out); return
+
+    if c == "wait":
+        tid, rest = resolve_tid(a, 1)
+        expr = rest[0] if rest else "true"
+        timeout_ms = int(rest[1]) if len(rest) > 1 else 15000
+        deadline = timeout_ms / 1000.0
+        conn = Conn()
+        elapsed = 0.0
+        while elapsed <= deadline:
+            v = evalv(conn, tid, "!!(" + expr + ")")
+            if v is True:
+                conn.close(); print("ready after ~%.1fs" % elapsed); return
+            time.sleep(0.5); elapsed += 0.5
+        conn.close(); die("timed out after %.0fs waiting for: %s" % (deadline, expr), 1)
+
+    if c == "pdf":
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else "/tmp/fcdp-%d.pdf" % tid
+        conn = Conn(); conn.cmd(tid, "Page.enable")
+        r = conn.cmd(tid, "Page.printToPDF", {"printBackground": True, "landscape": False}); conn.close()
+        res = result_or_die(r, "Page.printToPDF")
+        data = res.get("data")
+        if not data:
+            die("Page.printToPDF returned no data: %s" % json.dumps(res)[:400])
+        raw = base64.b64decode(data)
+        open(out, "wb").write(raw)
+        print("wrote %s (%d bytes)" % (out, len(raw))); return
+
+    if c == "intercept":
+        tid, rest = resolve_tid(a, 1)
+        secs = float(rest[0]) if rest else 6.0
+        conn = Conn()
+        conn.subscribe(filter=["Fetch.requestPaused"], tabId=tid)
+        result_or_die(conn.cmd(tid, "Fetch.enable", {"patterns": [{"urlPattern": "*"}]}), "Fetch.enable")
+        conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        seen = []
+
+        def on_ev(f):
+            if f.get("event") == "Fetch.requestPaused":
+                p = f.get("params", {}); rid = p.get("requestId"); req = p.get("request", {})
+                seen.append({"method": req.get("method"), "url": req.get("url")})
+                print("PAUSED %-4s %s" % (req.get("method"), (req.get("url") or "")[:100]))
+                conn.send_only(tid, "Fetch.continueRequest", {"requestId": rid})
+
+        conn.collect(secs, on_event=on_ev)
+        conn.cmd(tid, "Fetch.disable"); conn.close()
+        print("# intercepted & continued %d request(s) in %.0fs" % (len(seen), secs), file=sys.stderr); return
+
+    if c == "throttle":
+        tid, _ = resolve_tid(a, 1)
+        conn = Conn(); conn.cmd(tid, "Network.enable")
+        r = conn.cmd(tid, "Network.emulateNetworkConditions", {
+            "offline": False, "latency": 400,
+            "downloadThroughput": int(400 * 1024 / 8), "uploadThroughput": int(400 * 1024 / 8),
+            "connectionType": "cellular3g"}); conn.close()
+        show(r); print("# applied Slow-3G to tab %d" % tid, file=sys.stderr); return
+
+    if c == "trace":
+        tid, rest = resolve_tid(a, 1)
+        out = rest[0] if rest else "/tmp/fcdp-trace-%d.json" % tid
+        conn = Conn()
+        conn.subscribe(filter=["Tracing.dataCollected", "Tracing.tracingComplete"], tabId=tid)
+        result_or_die(conn.cmd(tid, "Tracing.start", {"transferMode": "ReportEvents"}), "Tracing.start")
+        conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        evs = conn.collect(4.0); conn.send_only(tid, "Tracing.end"); evs += conn.collect(3.0)
+        conn.close()
+        trace_events = []; complete = False
+        for f in evs:
+            if f.get("event") == "Tracing.dataCollected":
+                trace_events.extend(f.get("params", {}).get("value", []))
+            if f.get("event") == "Tracing.tracingComplete":
+                complete = True
+        json.dump({"traceEvents": trace_events}, open(out, "w"))
+        print("wrote %s (%d trace events, complete=%s)" % (out, len(trace_events), complete)); return
+
+    die("unknown command: %s  (fcdp help)" % c)
+
+
+if __name__ == "__main__":
+    main()

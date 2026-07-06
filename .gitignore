@@ -1,0 +1,7 @@
+node_modules/
+bridge.log
+*.log
+proof/*.pdf
+proof/*.json
+__pycache__/
+.DS_Store
