@@ -1,8 +1,9 @@
 // fcdp background service worker (MV3).
 // Connects OUT to the local bridge daemon over ws://127.0.0.1:<PORT>, then for
-// each request runs the FULL Chrome DevTools Protocol via chrome.debugger —
+// each request runs (most of) the Chrome DevTools Protocol via chrome.debugger —
 // chrome.debugger.sendCommand accepts ANY CDP method, so this exposes the whole
-// protocol (Fetch, Emulation, Tracing, Page.printToPDF, ...), not a subset.
+// protocol incl. Fetch/Emulation/Tracing/Page.printToPDF. NOTE: chrome.debugger is
+// security-restricted — a few browser-level/privileged CDP domains are withheld.
 //
 // Wire (bridge <-> extension), JSON text frames:
 //   bridge -> ext:  {id, tabId, method, params}            CDP command on a tab

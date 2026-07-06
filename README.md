@@ -1,6 +1,6 @@
-# fcdp — full Chrome DevTools Protocol from the CLI
+# fcdp — the Chrome DevTools Protocol from the CLI (most domains)
 
-A custom MV3 extension + local bridge daemon + Python CLI that exposes the **entire**
+A custom MV3 extension + local bridge daemon + Python CLI that exposes **most of the**
 Chrome DevTools Protocol on a Chrome profile, via the extension `chrome.debugger`
 permission. `chrome.debugger.sendCommand(target, method, params)` accepts **any** CDP
 method, so this reaches the domains a curated tool like `ccb` cannot:

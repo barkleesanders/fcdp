@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fcdp - Full Chrome DevTools Protocol from the CLI, via our OWN MV3 extension.
+"""fcdp - most of the Chrome DevTools Protocol from the CLI, via our OWN MV3 extension.
 
 ONE tool for everything on your REAL Default profile: everyday driving
 (open/nav/read/find/click/type/fill/key/scroll/shot/wait/js/text) AND the four
