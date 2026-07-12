@@ -156,7 +156,12 @@ def resolve_tid(a, idx):
 
 
 def evalv(conn, tid, expr):
-    r = conn.cmd(tid, "Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True})
+    # replMode:True lets a snippet re-declare `const`/`let` on a repeat call instead of
+    # throwing "Identifier 'x' has already been declared". The page's default execution
+    # context persists across evaluate calls (REPL semantics); replMode is how DevTools'
+    # own console tolerates it. (Verified against Claude-for-Chrome's CDP driver, 2026-07-12.)
+    r = conn.cmd(tid, "Runtime.evaluate",
+                 {"expression": expr, "returnByValue": True, "awaitPromise": True, "replMode": True})
     res = result_or_die(r, "Runtime.evaluate")
     return res.get("result", {}).get("value")
 
@@ -329,7 +334,11 @@ def main():
         tid, rest = resolve_tid(a, 1)
         code = " ".join(rest)
         conn = Conn()
-        r = conn.cmd(tid, "Runtime.evaluate", {"expression": code, "returnByValue": True, "awaitPromise": True})
+        # replMode:True → snippets may re-declare const/let across calls without the
+        # "already been declared" collision (see evalv). You no longer need to wrap
+        # every snippet in an IIFE. (Ported from Claude-for-Chrome, verified 2026-07-12.)
+        r = conn.cmd(tid, "Runtime.evaluate",
+                     {"expression": code, "returnByValue": True, "awaitPromise": True, "replMode": True})
         conn.close()
         res = result_or_die(r, "Runtime.evaluate")
         rv = res.get("result", {})

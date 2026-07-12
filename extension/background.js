@@ -73,6 +73,31 @@ function sendCommand(tabId, method, params) {
   });
 }
 
+// A CDP command can fail transiently when the debugger silently lost the tab (renderer
+// swap, a brief chrome-extension:// URL, another debugger extension touching the tab).
+// The cure is always the same: force a clean detach+reattach and retry ONCE. This is
+// what Claude-for-Chrome's own CDP driver does inside every sendCommand (RE'd 2026-07-12,
+// ext fcoeoabgfenejglbffodgkkbkcdhcgfn) — it turns the manual `fcdp detach <tab>` dance
+// into something the bridge handles itself.
+const TRANSIENT_CDP = [
+  "debugger is not attached",
+  "detached while handling command",
+  "cannot access a chrome-extension:// url of different extension",
+];
+async function sendCommandWithRetry(tabId, method, params) {
+  try {
+    return await sendCommand(tabId, method, params);
+  } catch (e) {
+    const msg = ((e && e.message) || String(e)).toLowerCase();
+    if (!TRANSIENT_CDP.some((s) => msg.includes(s))) throw e;
+    // clean-slate reattach, then retry exactly once
+    attached.delete(tabId);
+    await new Promise((res) => chrome.debugger.detach({ tabId }, () => { chrome.runtime.lastError; res(); }));
+    await ensureAttached(tabId);
+    return await sendCommand(tabId, method, params);
+  }
+}
+
 async function handle(data) {
   let msg;
   try { msg = JSON.parse(data); } catch { return; }
@@ -110,7 +135,7 @@ async function handle(data) {
     // Default: a raw CDP command on a tab.
     if (tabId == null) throw new Error("tabId required for CDP command " + method);
     await ensureAttached(tabId);
-    const result = await sendCommand(tabId, method, params);
+    const result = await sendCommandWithRetry(tabId, method, params);
     return send({ id, result });
   } catch (e) {
     return send({ id, error: { message: (e && e.message) || String(e) } });
