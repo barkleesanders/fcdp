@@ -18,8 +18,192 @@ import socket, struct, json, sys, os, base64, time, select, re
 SOCK = "/tmp/fcdp.sock"
 CACHE = os.path.expanduser("~/.cache/fcdp-tab")
 
+# ---- direct-CDP transport (no extension, no bridge) ---------------------------
+# fcdp normally reaches Chrome through our MV3 extension + bridge, because Chrome
+# 136+ REFUSES --remote-debugging-port on the real Default profile. That refusal is
+# the entire reason this tool exists.
+#
+# It does NOT apply to a Chrome launched on its own --user-data-dir, which may expose
+# a debug port freely. mac-mini runs exactly that (headless Chrome on :9222 with a
+# logged-in profile, supervised by a KeepAlive launchd job). There, the
+# extension route is impossible anyway: verified 2026-07-29 that --load-extension is
+# INERT on Chrome 150 (scratch profile registered 0 extensions, no service-worker
+# target), and a headless Chrome has no UI for the manual "Load unpacked" step.
+#
+# So: set FCDP_CDP_URL to a debug endpoint and the same CLI drives it over raw CDP.
+#   FCDP_CDP_URL=http://127.0.0.1:9222 fcdp tabs
+# Everything except the 5 bridge-only Meta.* calls is passed through untouched.
+CDP_URL = os.environ.get("FCDP_CDP_URL", "").rstrip("/")
 
-class Conn:
+
+def _autodetect_cdp():
+    """Only consulted when there is NO bridge socket, so a host with a working bridge
+    (the laptop) can never be silently switched off it. On a host like mac-mini — where
+    the extension route is impossible (--load-extension inert on Chrome 150, and headless
+    has no UI for Load-unpacked) but a debug-port Chrome is supervised — this makes plain
+    `fcdp <cmd>` work with no env var.
+
+    IPv6 first-class: a debug port often binds [::1] ONLY, which is exactly what made the
+    2026-07-29 probe look dead when checked on 127.0.0.1."""
+    import urllib.request
+    for base in ("http://127.0.0.1:9222", "http://[::1]:9222"):
+        try:
+            with urllib.request.urlopen(base + "/json/version", timeout=2):
+                return base
+        except Exception:
+            continue
+    return None
+
+
+# Resolve the transport EAGERLY. It must be known before argument parsing, because
+# tabId syntax differs per transport (bridge = chrome.tabs ints, direct = hex target
+# ids) and resolve_tid() runs long before the first Conn() is built.
+if not CDP_URL and not os.path.exists(SOCK):
+    _found = _autodetect_cdp()
+    if _found:
+        CDP_URL = _found
+        print("fcdp: no bridge socket; using direct CDP at %s (set FCDP_CDP_URL to pin it)"
+              % _found, file=sys.stderr)
+
+
+class DirectConn:
+    """Raw-CDP transport, interface-compatible with Conn.
+
+    Used when FCDP_CDP_URL points at a Chrome with --remote-debugging-port. Talks
+    HTTP for target discovery and one WebSocket per tab for commands, so no
+    extension and no bridge are involved.
+
+    Meta.* are bridge concepts, emulated here:
+      listTabs  -> GET /json/list           createTab -> PUT /json/new?url=
+      closeTab  -> GET /json/close/<id>     attach/detach -> no-ops (raw CDP has
+                   no debugger-arbitration; the port IS the attachment)
+    """
+    def __init__(self, timeout=120):
+        import urllib.request
+        self._url = urllib.request
+        self.base = CDP_URL
+        self.timeout = timeout
+        self.evq = []
+        self._ws = {}
+        self._id = 0
+        try:
+            self._http("/json/version")
+        except Exception as e:
+            die("FCDP_CDP_URL=%s is not answering (%s).\n"
+                "Is that Chrome running? Note IPv6: a debug port may bind [::1] only, "
+                "so try http://[::1]:<port>." % (self.base, e))
+
+    def _http(self, path):
+        with self._url.urlopen(self.base + path, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def _pages(self):
+        return [t for t in self._http("/json/list") if t.get("type") == "page"]
+
+    def _sock(self, tabId):
+        if tabId in self._ws:
+            return self._ws[tabId]
+        from websockets.sync.client import connect
+        tgt = next((t for t in self._pages() if str(t.get("id")) == str(tabId)), None)
+        if tgt is None:
+            die("no CDP target %s at %s (run `fcdp tabs` to list)" % (tabId, self.base))
+        ws = connect(tgt["webSocketDebuggerUrl"], open_timeout=20,
+                     close_timeout=5, max_size=64 * 1024 * 1024)
+        self._ws[tabId] = ws
+        return ws
+
+    def _next(self):
+        self._id += 1
+        return self._id
+
+    def cmd(self, tabId, method, params=None):
+        params = params or {}
+        if method == "Meta.listTabs":
+            return {"result": {"tabs": [{"tabId": t.get("id"), "url": t.get("url"),
+                                         "title": t.get("title")} for t in self._pages()]}}
+        if method == "Meta.createTab":
+            u = params.get("url") or "about:blank"
+            import urllib.parse, urllib.request as _u
+            req = _u.Request(self.base + "/json/new?" + urllib.parse.quote(u, safe=":/?&=#"),
+                             method="PUT")
+            with _u.urlopen(req, timeout=20) as r:
+                t = json.loads(r.read().decode("utf-8", "replace"))
+            return {"result": {"tabId": t.get("id")}}
+        if method == "Meta.closeTab":
+            self._http("/json/close/%s" % tabId)
+            return {"result": {"closed": True}}
+        if method in ("Meta.attach", "Meta.detach"):
+            # No arbitration in raw CDP — report success so callers behave identically.
+            return {"result": {"ok": True, "note": "no-op in direct-CDP mode"}}
+
+        if tabId is None:
+            pages = self._pages()
+            if not pages:
+                die("no page targets at %s" % self.base)
+            tabId = pages[0].get("id")
+        ws = self._sock(tabId)
+        cid = self._next()
+        ws.send(json.dumps({"id": cid, "method": method, "params": params}))
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            msg = json.loads(ws.recv(timeout=max(1, deadline - time.time())))
+            if msg.get("id") == cid:
+                return msg
+            if msg.get("method"):                      # CDP event
+                self.evq.append({"event": msg["method"], "tabId": tabId,
+                                 "params": msg.get("params", {})})
+        return {"error": {"message": "timeout waiting for %s" % method}}
+
+    def send_only(self, tabId, method, params=None):
+        self.cmd(tabId, method, params)
+
+    def subscribe(self, filter=None, tabId=None):
+        if tabId is None:
+            pages = self._pages()
+            tabId = pages[0].get("id") if pages else None
+        self._sub_tab = tabId
+        self._sock(tabId)
+        return {"result": {"subscribed": True}}
+
+    def collect(self, seconds, on_event=None):
+        """Drain buffered events, then read the socket for `seconds`. Mirrors
+        _BridgeConn.collect so event-driven commands behave the same either way."""
+        events = []
+        for f in self.evq:
+            events.append(f)
+            if on_event:
+                on_event(f)
+        self.evq = []
+        tabId = getattr(self, "_sub_tab", None) or next(iter(self._ws), None)
+        if tabId is None:
+            return events
+        ws = self._sock(tabId)
+        end = time.time() + seconds
+        while True:
+            remaining = end - time.time()
+            if remaining <= 0:
+                break
+            try:
+                msg = json.loads(ws.recv(timeout=remaining))
+            except Exception:
+                break                                  # timeout or closed: done collecting
+            if msg.get("method"):
+                ev = {"event": msg["method"], "tabId": tabId, "params": msg.get("params", {})}
+                events.append(ev)
+                if on_event:
+                    on_event(ev)
+        return events
+
+    def close(self):
+        for ws in self._ws.values():
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self._ws.clear()
+
+
+class _BridgeConn:
     """One persistent Unix-socket connection to the bridge. Demuxes command
     replies (have `id`) from CDP events (have `event`)."""
     def __init__(self, timeout=120):
@@ -114,13 +298,35 @@ class Conn:
             pass
 
 
+def Conn(timeout=120):
+    """Transport factory. CDP_URL set (env or startup auto-detect) -> raw CDP, no
+    extension/bridge needed; otherwise the MV3-extension bridge, which is the only
+    way to reach a real Default profile."""
+    return DirectConn(timeout) if CDP_URL else _BridgeConn(timeout)
+
+
 def die(msg, code=2):
     print(msg, file=sys.stderr)
     sys.exit(code)
 
 
 def show(r):
-    print(json.dumps(r, indent=2)[:8000])
+    # The 8000-char cap keeps interactive output readable, but it SILENTLY emits invalid
+    # JSON — a programmatic consumer piping `fcdp raw ... | json.loads` just gets
+    # "Unexpected end of JSON input" with nothing pointing at the cap. (Cost a debugging
+    # cycle 2026-07-29 porting caltrans-pra capture-session.mjs off the removed :9222.)
+    # Default behavior is unchanged; FCDP_FULL=1 opts into complete output, and any
+    # truncation now announces itself on STDERR so it can't corrupt piped JSON.
+    out = json.dumps(r, indent=2)
+    if os.environ.get("FCDP_FULL") == "1" or len(out) <= 8000:
+        print(out)
+        return
+    print(out[:8000])
+    print(
+        "fcdp: output truncated at 8000 chars (%d total) — this JSON is INCOMPLETE. "
+        "Set FCDP_FULL=1 for the full payload." % len(out),
+        file=sys.stderr,
+    )
 
 
 def result_or_die(r, what):
@@ -140,18 +346,33 @@ def save_tab(tid):
 
 def cached_tab():
     try:
-        return int(open(CACHE).read().strip())
+        v = open(CACHE).read().strip()
     except Exception:
         return None
+    if not v:
+        return None
+    return int(v) if v.isdigit() else v          # direct-CDP ids are hex strings
+
+
+def _is_tid(s):
+    """Bridge tab ids are chrome.tabs integers; direct-CDP target ids are 32-char
+    uppercase hex. Accept hex ONLY in direct mode so a hex-looking argument can't be
+    mistaken for a tabId when talking to the bridge."""
+    if re.fullmatch(r"\d+", s):
+        return True
+    return bool(CDP_URL) and bool(re.fullmatch(r"[0-9A-Fa-f]{16,}", s))
 
 
 def resolve_tid(a, idx):
-    """Return (tabId, remaining_args). Uses a[idx] if it's an int, else the cached tab."""
-    if len(a) > idx and re.fullmatch(r"\d+", a[idx]):
-        return int(a[idx]), a[idx + 1:]
+    """Return (tabId, remaining_args). Uses a[idx] if it looks like a tab id for the
+    active transport, else the cached tab."""
+    if len(a) > idx and _is_tid(a[idx]):
+        v = a[idx]
+        return (int(v) if v.isdigit() else v), a[idx + 1:]
     t = cached_tab()
     if t is None:
-        die("no tabId given and none cached — run `fcdp open <url>` first, or pass a tabId")
+        die("no tabId given and none cached — run `fcdp open <url>` first, or pass a tabId"
+            + ("\n(direct-CDP mode: `fcdp tabs` lists hex target ids)" if CDP_URL else ""))
     return t, a[idx:]
 
 
