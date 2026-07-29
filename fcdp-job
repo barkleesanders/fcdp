@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# fcdp-job — run a browser job in an ISOLATED, self-cleaning fcdp tab.
+#
+# THE TWO FAILURE MODES THIS PREVENTS (both verified on mac-mini 2026-07-29):
+#
+#   1. CLOBBERING. fcdp caches "the active tab" in ONE shared file
+#      (~/.cache/fcdp-tab), last-writer-wins. Two concurrent jobs:
+#         job A: fcdp open X   -> cache=A
+#         job B: fcdp open Y   -> cache=B
+#         job A: fcdp js "..."  (no tabId) -> runs against B's tab.
+#      Job A silently scrapes job B's page. No error, wrong data.
+#      Fix: FCDP_TAB_CACHE gives this job its own cache file.
+#
+#   2. TAB LEAKS -> memory. A job that opens a tab and dies before closing it
+#      leaks that tab forever. Chrome on the mini was already 4.2 GB across 33
+#      processes of 16 GB total, and three duplicate chrome://extensions tabs had
+#      accumulated from setup work alone. Fix: `trap ... EXIT` closes the tab on
+#      ANY exit path — success, failure, timeout, or Ctrl-C.
+#
+# Usage:
+#   fcdp-job <url> <command...>        # $FCDP_JOB_TAB is exported to the command
+#   fcdp-job --keep <url> <command...> # leave the tab open (debugging)
+#
+# Example (what a cron should look like):
+#   fcdp-job https://records.example.gov/client/requests/12-3456 \
+#     bash -c 'fcdp js "$FCDP_JOB_TAB" "document.title"'
+#
+# Env:
+#   FCDP_CDP_URL   set to http://127.0.0.1:9222 to use the headless profile
+#                  instead of the real Default profile (bridge).
+#   FCDP_JOB_TIMEOUT  per-fcdp-call timeout, seconds (default 60)
+
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+FCDP="${FCDP:-$HOME/tools/fcdp/fcdp}"
+TMO="${FCDP_JOB_TIMEOUT:-60}"
+KEEP=0
+[ "${1:-}" = "--keep" ] && { KEEP=1; shift; }
+
+URL="${1:?usage: fcdp-job [--keep] <url> <command...>}"; shift
+[ $# -gt 0 ] || { echo "fcdp-job: no command given" >&2; exit 64; }
+
+# Per-job tab cache — this is the anti-clobber mechanism. $$ is unique per process,
+# so concurrent jobs cannot see each other's "active tab".
+FCDP_TAB_CACHE="$(mktemp -t fcdp-job-tab.XXXXXX)"
+export FCDP_TAB_CACHE
+
+cleanup() {
+  local rc=$?
+  if [ "$KEEP" = "1" ]; then
+    echo "fcdp-job: --keep set, leaving tab ${FCDP_JOB_TAB:-?} open" >&2
+  elif [ -n "${FCDP_JOB_TAB:-}" ]; then
+    # Idempotent: fcdp reports "no such target (already closed)" rather than failing,
+    # so this is safe even if the job already closed its own tab.
+    timeout "$TMO" "$FCDP" close "$FCDP_JOB_TAB" >/dev/null 2>&1 \
+      || echo "fcdp-job: WARNING could not close tab $FCDP_JOB_TAB (leaked)" >&2
+  fi
+  rm -f "$FCDP_TAB_CACHE"
+  exit $rc
+}
+trap cleanup EXIT INT TERM
+
+if ! timeout "$TMO" "$FCDP" open "$URL" >/dev/null 2>&1; then
+  echo "fcdp-job: failed to open $URL" >&2
+  exit 7
+fi
+
+FCDP_JOB_TAB="$(cat "$FCDP_TAB_CACHE" 2>/dev/null)"
+if [ -z "$FCDP_JOB_TAB" ]; then
+  echo "fcdp-job: opened $URL but got no tab id — is the bridge/CDP endpoint healthy?" >&2
+  exit 7
+fi
+export FCDP_JOB_TAB
+
+"$@"

@@ -16,7 +16,13 @@ Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
 import socket, struct, json, sys, os, base64, time, select, re
 
 SOCK = "/tmp/fcdp.sock"
-CACHE = os.path.expanduser("~/.cache/fcdp-tab")
+# The active-tab cache is a SINGLE shared file by default, which is last-writer-wins.
+# Two concurrent jobs therefore silently drive each other's tab: job A opens (cache=A),
+# job B opens (cache=B), and job A's next tabId-less command targets B. Verified on
+# mac-mini 2026-07-29 by watching the file change under two sequential opens.
+# FCDP_TAB_CACHE gives a job its own cache file so tabId-less commands stay scoped to
+# it — this is what `fcdp-job` sets, and what any concurrent cron should set.
+CACHE = os.path.expanduser(os.environ.get("FCDP_TAB_CACHE") or "~/.cache/fcdp-tab")
 
 # ---- direct-CDP transport (no extension, no bridge) ---------------------------
 # fcdp normally reaches Chrome through our MV3 extension + bridge, because Chrome
@@ -97,6 +103,23 @@ class DirectConn:
         with self._url.urlopen(self.base + path, timeout=15) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
 
+    def _http_text(self, path):
+        # /json/close/<id> and /json/activate/<id> answer with a bare string
+        # ("Target is closing"), NOT JSON — json.loads() raises JSONDecodeError on
+        # them. Every close through this transport crashed with a traceback until
+        # this existed (found 2026-07-29 while pruning leaked tabs on mac-mini).
+        # Worse, the crash was MISLEADING: the HTTP close had already succeeded, so
+        # callers logged "FAILED" for tabs that were in fact closed.
+        # 404 = no such target, i.e. already closed. Closing is idempotent by
+        # nature and a pruner must be safe to re-run, so report it rather than raise.
+        try:
+            with self._url.urlopen(self.base + path, timeout=15) as r:
+                return r.read().decode("utf-8", "replace").strip()
+        except self._url.HTTPError as e:
+            if e.code == 404:
+                return "no such target (already closed)"
+            raise
+
     def _pages(self):
         return [t for t in self._http("/json/list") if t.get("type") == "page"]
 
@@ -130,8 +153,9 @@ class DirectConn:
                 t = json.loads(r.read().decode("utf-8", "replace"))
             return {"result": {"tabId": t.get("id")}}
         if method == "Meta.closeTab":
-            self._http("/json/close/%s" % tabId)
-            return {"result": {"closed": True}}
+            self._ws.pop(tabId, None)   # drop the cached socket; the target is going away
+            return {"result": {"closed": True,
+                               "note": self._http_text("/json/close/%s" % tabId)}}
         if method in ("Meta.attach", "Meta.detach"):
             # No arbitration in raw CDP — report success so callers behave identically.
             return {"result": {"ok": True, "note": "no-op in direct-CDP mode"}}
