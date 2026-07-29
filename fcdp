@@ -370,6 +370,21 @@ def resolve_tid(a, idx):
         v = a[idx]
         return (int(v) if v.isdigit() else v), a[idx + 1:]
     t = cached_tab()
+    if t is None and CDP_URL:
+        # Direct mode has no `fcdp open` history to seed the cache, and a freshly
+        # provisioned host (mac-mini) therefore failed EVERY command with
+        # "no tabId given and none cached" — breaking this tool's stated contract that
+        # "tabId is OPTIONAL on every command". The debug port already enumerates its
+        # targets, so fall back to the first page rather than dying.
+        try:
+            import urllib.request
+            with urllib.request.urlopen(CDP_URL + "/json/list", timeout=5) as r:
+                pages = [x for x in json.loads(r.read().decode("utf-8", "replace"))
+                         if x.get("type") == "page"]
+            if pages:
+                t = pages[0].get("id")
+        except Exception:
+            pass
     if t is None:
         die("no tabId given and none cached — run `fcdp open <url>` first, or pass a tabId"
             + ("\n(direct-CDP mode: `fcdp tabs` lists hex target ids)" if CDP_URL else ""))
