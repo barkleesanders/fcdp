@@ -476,6 +476,8 @@ INTERACT:
   fcdp key  [tab] <Key>           press a key (Enter, Tab, Escape, ArrowDown, ...)
   fcdp scroll [tab] <up|down|left|right> [n]
   fcdp js  [tab] "<code>"         Runtime.evaluate (returnByValue, awaitPromise)
+  fcdp console [tab] [secs] [--reload]   collect console logs/errors/exceptions
+  fcdp network [tab] [secs] [--reload]   collect requests: status, method, URL, failures
   fcdp wait [tab] "<jsExpr>" [ms] poll until truthy
 
 FULL-CDP POWER (the 4 domains ccb CANNOT do):
@@ -733,8 +735,26 @@ def main():
         print("wrote %s (%d bytes)" % (out, len(raw))); return
 
     if c == "intercept":
+        # Same tabId/duration ambiguity as console/network: `fcdp intercept 6`
+        # reads 6 as a TAB ID (resolve_tid accepts any digit-string), silently
+        # targeting a nonexistent tab. `--secs N` is the unambiguous form;
+        # `fcdp intercept <tabId> <secs>` keeps working. (Fixed 2026-08-01.)
+        argv = a[1:]
+        secs = 6.0
+        if "--secs" in argv:
+            i = argv.index("--secs")
+            try:
+                secs = float(argv[i + 1])
+            except (IndexError, ValueError):
+                die("--secs needs a number, e.g. `fcdp intercept --secs 8`")
+            del argv[i:i + 2]
+        a = [a[0]] + argv
         tid, rest = resolve_tid(a, 1)
-        secs = float(rest[0]) if rest else 6.0
+        if rest:
+            try:
+                secs = float(rest[0])
+            except ValueError:
+                pass
         conn = Conn()
         conn.subscribe(filter=["Fetch.requestPaused"], tabId=tid)
         result_or_die(conn.cmd(tid, "Fetch.enable", {"patterns": [{"urlPattern": "*"}]}), "Fetch.enable")
@@ -751,6 +771,93 @@ def main():
         conn.collect(secs, on_event=on_ev)
         conn.cmd(tid, "Fetch.disable"); conn.close()
         print("# intercepted & continued %d request(s) in %.0fs" % (len(seen), secs), file=sys.stderr); return
+
+    # console / network: the two reads ccb had and fcdp did NOT (added 2026-08-01).
+    # `raw` cannot cover these — raw sends COMMANDS, and console/network arrive as
+    # CDP *events*, so `raw Runtime.consoleAPICalled` errors ("not a method"). They
+    # need the same subscribe+collect plumbing `intercept` uses.
+    # Both capture what fires DURING the window; pass --reload to also catch
+    # page-load-time messages/requests (Log.enable alone replays only stored entries).
+    if c in ("console", "network"):
+        # Duration MUST be passed as `--secs N`. A bare positional number is
+        # ambiguous with tabId — resolve_tid() treats any digit-string as a tab id,
+        # so `fcdp console 5` silently targets nonexistent tab 5 and collects
+        # nothing (found the hard way 2026-08-01; `intercept` has the same latent
+        # ambiguity). `fcdp console <tabId> 5` still works because resolve_tid
+        # consumes the tabId first and leaves 5 in rest.
+        argv = a[1:]
+        secs = 6.0
+        if "--secs" in argv:
+            i = argv.index("--secs")
+            try:
+                secs = float(argv[i + 1])
+            except (IndexError, ValueError):
+                die("--secs needs a number, e.g. `fcdp %s --secs 8`" % c)
+            del argv[i:i + 2]
+        a = [a[0]] + argv
+        tid, rest = resolve_tid(a, 1)
+        reload_first = "--reload" in rest
+        rest = [x for x in rest if x != "--reload"]
+        if rest:
+            try:
+                secs = float(rest[0])
+            except ValueError:
+                pass
+        conn = Conn()
+        if c == "console":
+            evs = ["Runtime.consoleAPICalled", "Runtime.exceptionThrown", "Log.entryAdded"]
+        else:
+            evs = ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFailed"]
+        conn.subscribe(filter=evs, tabId=tid)
+        for dom in (["Runtime", "Log"] if c == "console" else ["Network"]):
+            conn.cmd(tid, dom + ".enable")
+        if reload_first:
+            conn.cmd(tid, "Page.enable"); conn.send_only(tid, "Page.reload", {"ignoreCache": True})
+        seen = []
+        req_method = {}
+
+        def _flat(arg):
+            """CDP RemoteObject -> printable scalar."""
+            if not isinstance(arg, dict):
+                return str(arg)
+            if "value" in arg:
+                return str(arg["value"])
+            return arg.get("description") or arg.get("unserializableValue") or arg.get("type", "?")
+
+        def on_ev(f):
+            ev, p = f.get("event"), f.get("params", {})
+            if ev == "Runtime.consoleAPICalled":
+                lvl = p.get("type", "log")
+                txt = " ".join(_flat(x) for x in p.get("args", []))
+                seen.append({"kind": "console", "level": lvl, "text": txt})
+                print("%-7s %s" % (lvl.upper(), txt[:200]))
+            elif ev == "Runtime.exceptionThrown":
+                d = (p.get("exceptionDetails") or {})
+                txt = d.get("text", "") + " " + ((d.get("exception") or {}).get("description") or "")
+                seen.append({"kind": "exception", "text": txt.strip()})
+                print("EXCEPT  %s" % txt.strip()[:200])
+            elif ev == "Log.entryAdded":
+                e = p.get("entry", {})
+                seen.append({"kind": "log", "level": e.get("level"), "text": e.get("text", "")})
+                print("%-7s %s" % ((e.get("level") or "log").upper(), (e.get("text") or "")[:200]))
+            elif ev == "Network.requestWillBeSent":
+                req_method[p.get("requestId")] = (p.get("request") or {}).get("method")
+            elif ev == "Network.responseReceived":
+                r = p.get("response") or {}
+                m = req_method.get(p.get("requestId")) or "?"
+                seen.append({"kind": "response", "status": r.get("status"), "method": m, "url": r.get("url")})
+                print("%-3s %-4s %s" % (r.get("status"), m, (r.get("url") or "")[:100]))
+            elif ev == "Network.loadingFailed":
+                seen.append({"kind": "failed", "error": p.get("errorText"), "requestId": p.get("requestId")})
+                print("FAIL    %s" % (p.get("errorText") or "")[:120])
+
+        conn.collect(secs, on_event=on_ev)
+        for dom in (["Runtime", "Log"] if c == "console" else ["Network"]):
+            conn.cmd(tid, dom + ".disable")
+        conn.close()
+        print("# %s: %d event(s) in %.0fs%s" % (c, len(seen), secs,
+              " (after reload)" if reload_first else ""), file=sys.stderr)
+        return
 
     if c == "throttle":
         tid, _ = resolve_tid(a, 1)
