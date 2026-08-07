@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# fcdp-cdp — run/stop the browser-level CDP endpoint that fronts the fcdp extension.
+#
+#   fcdp-cdp start [--port N] [--verbose]   # background, logs to /tmp/fcdp-cdp.log
+#   fcdp-cdp run   [--port N] [--verbose]   # foreground
+#   fcdp-cdp stop
+#   fcdp-cdp status
+#
+# Then point any CDP client at it:
+#   agent-browser connect 9333
+#
+# This gives agent-browser (and Playwright/Puppeteer connectOverCDP) the ~60 verbs
+# fcdp has no equivalent for — snapshot/refs, diff, a11y, vitals, react, HAR, batch —
+# driving your REAL logged-in Default Chrome profile instead of a clean throwaway one.
+set -uo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${FCDP_CDP_PORT:-9333}"
+LOG="${FCDP_CDP_LOG:-/tmp/fcdp-cdp.log}"
+PIDPAT="fcdp-cdp.mjs"
+
+cmd="${1:-start}"; shift || true
+
+case "$cmd" in
+  run)   exec node "$DIR/fcdp-cdp.mjs" "$@" ;;
+  start)
+    if pgrep -f "$PIDPAT" >/dev/null 2>&1; then
+      echo "fcdp-cdp: already running (pid $(pgrep -f "$PIDPAT" | tr '\n' ' '))" >&2
+      exit 0
+    fi
+    nohup node "$DIR/fcdp-cdp.mjs" "$@" >"$LOG" 2>&1 &
+    sleep 2
+    if pgrep -f "$PIDPAT" >/dev/null 2>&1; then
+      echo "fcdp-cdp: started on port $PORT (log: $LOG)"
+      echo "  try: agent-browser connect $PORT"
+    else
+      echo "fcdp-cdp: FAILED to start — see $LOG" >&2; tail -5 "$LOG" >&2; exit 1
+    fi ;;
+  stop)
+    pkill -f "$PIDPAT" && echo "fcdp-cdp: stopped" || { echo "fcdp-cdp: not running" >&2; exit 1; } ;;
+  status)
+    if pgrep -f "$PIDPAT" >/dev/null 2>&1; then
+      echo "fcdp-cdp: running (pid $(pgrep -f "$PIDPAT" | tr '\n' ' '))"
+      curl -s --max-time 5 "http://127.0.0.1:$PORT/json/version" | head -c 200; echo
+    else
+      echo "fcdp-cdp: not running"; exit 1
+    fi ;;
+  *) echo "usage: fcdp-cdp {start|run|stop|status} [--port N] [--verbose]" >&2; exit 64 ;;
+esac
