@@ -4,9 +4,10 @@
   "description": "Chrome DevTools Protocol CLI for real and isolated Chrome runtimes",
   "main": "index.js",
   "scripts": {
-    "test": "npm run test:syntax && npm run test:domains",
-    "test:syntax": "python3 -m py_compile fcdp tools/repro/fcdp-unrestricted-domains/*.py && bash -n fcdp-chromeos chromeos-entrypoint.sh fcdp-pipe tools/repro/fcdp-unrestricted-domains/*.sh && node --check bridge.mjs && node --check fcdp-pipe.mjs",
-    "test:domains": "tools/repro/fcdp-unrestricted-domains/run-all.sh"
+    "test": "npm run test:syntax && npm run test:domains && npm run test:chromeos-lifecycle",
+    "test:syntax": "python3 -m py_compile fcdp chromeos-host-relay.py tools/repro/fcdp-unrestricted-domains/*.py && bash -n fcdp-chromeos chromeos-entrypoint.sh fcdp-pipe tools/repro/fcdp-unrestricted-domains/*.sh && node --check bridge.mjs && node --check fcdp-pipe.mjs",
+    "test:domains": "tools/repro/fcdp-unrestricted-domains/run-all.sh",
+    "test:chromeos-lifecycle": "tools/repro/fcdp-unrestricted-domains/run-chromeos-lifecycle.sh"
   },
   "keywords": [],
   "author": "",

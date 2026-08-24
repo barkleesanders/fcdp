@@ -22,3 +22,6 @@
 - Made the ChromeOS transport remember the first free loopback port in 9333-9399,
   with a fail-closed `FCDP_CHROMEOS_PORT` override, so an unrelated local listener
   cannot block startup.
+- Replaced Apple container's resetting published-port proxy with a managed,
+  loopback-only host TCP relay to the container's private CDP endpoint. Added
+  lifecycle, binding, PID-cleanup, positive, and negative regression controls.

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 RESULT="${1:-${TMPDIR%/}/fcdp-chromeos-matrix.json}"
 
+"$ROOT/tools/repro/fcdp-unrestricted-domains/run-host-relay.sh" >/dev/null
 "$ROOT/fcdp-chromeos" start >/dev/null
 FCDP_CDP_URL="$("$ROOT/fcdp-chromeos" endpoint)"
 export FCDP_CDP_URL

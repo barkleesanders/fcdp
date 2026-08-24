@@ -13,6 +13,8 @@ CHROME_BIN="$CHROME_DIR/chrome"
 IMAGE="fcdp-chromeos-runtime:${SNAPSHOT_REVISION}-v1"
 NAME="fcdp-chromeos"
 PORT_FILE="$CACHE_BASE/host-port"
+RELAY_PID_FILE="$CACHE_BASE/host-relay.pid"
+RELAY_LOG_FILE="$CACHE_BASE/host-relay.log"
 HOST_PORT="${FCDP_CHROMEOS_PORT:-}"
 if [[ -z "$HOST_PORT" && -f "$PORT_FILE" ]]; then
   HOST_PORT="$(<"$PORT_FILE")"
@@ -94,11 +96,99 @@ import socket
 import sys
 
 with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind(("127.0.0.1", int(sys.argv[1])))
     except OSError:
         raise SystemExit(1)
 PY
+}
+
+relay_process_matches() {
+  local pid="$1"
+  local command
+  command="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+  [[ "$command" == *"$ROOT/chromeos-host-relay.py"* ]]
+}
+
+stop_host_relay() {
+  [[ -f "$RELAY_PID_FILE" ]] || return 0
+  local pid
+  pid="$(<"$RELAY_PID_FILE")"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    if relay_process_matches "$pid"; then
+      kill "$pid"
+      for _ in {1..30}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        printf 'ChromeOS host relay did not stop cleanly: %s\n' "$pid" >&2
+        return 2
+      fi
+    else
+      printf 'refusing to stop unrelated process from stale relay PID file: %s\n' \
+        "$pid" >&2
+    fi
+  fi
+  rm -f -- "$RELAY_PID_FILE"
+}
+
+container_ipv4() {
+  container ls -a --format json | jq -r --arg name "$NAME" '
+    first(
+      .[]
+      | select(.configuration.id == $name)
+      | .status.networks[]?.ipv4Address
+      | select(type == "string" and length > 0)
+      | split("/")[0]
+    ) // empty
+  '
+}
+
+private_ipv4() {
+  python3 - "$1" <<'PY'
+import ipaddress
+import sys
+
+address = ipaddress.ip_address(sys.argv[1])
+if address.version != 4 or not (address.is_private or address.is_loopback):
+    raise SystemExit(1)
+PY
+}
+
+start_host_relay() {
+  local guest_ip="$1"
+  private_ipv4 "$guest_ip" || {
+    printf 'container reported an invalid private IPv4 address: %s\n' "$guest_ip" >&2
+    return 2
+  }
+  stop_host_relay
+  port_available "$HOST_PORT" || {
+    printf 'ChromeOS loopback port became unavailable before relay start: %s\n' \
+      "$HOST_PORT" >&2
+    return 2
+  }
+  : >"$RELAY_LOG_FILE"
+  nohup python3 "$ROOT/chromeos-host-relay.py" \
+    --listen-port "$HOST_PORT" \
+    --target-host "$guest_ip" \
+    --target-port 9334 \
+    </dev/null >>"$RELAY_LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" >"$RELAY_PID_FILE"
+  for _ in {1..50}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      sed -n '1,80p' "$RELAY_LOG_FILE" >&2
+      printf 'ChromeOS host relay exited during startup\n' >&2
+      return 2
+    fi
+    port_available "$HOST_PORT" || return 0
+    sleep 0.1
+  done
+  sed -n '1,80p' "$RELAY_LOG_FILE" >&2
+  printf 'ChromeOS host relay did not bind 127.0.0.1:%s\n' "$HOST_PORT" >&2
+  return 2
 }
 
 set_host_port() {
@@ -145,14 +235,17 @@ container_exists() {
 start_runtime() {
   require jq
   require container
-  select_host_port
+  require python3
   if endpoint_healthy; then
     printf '%s\n' "$ENDPOINT"
     return
   fi
+  stop_host_relay
+  select_host_port
   install_snapshot
   install_image
   if container_exists; then
+    stop_host_relay
     container stop "$NAME" >/dev/null 2>&1 || true
     container rm "$NAME" >/dev/null
   fi
@@ -162,11 +255,22 @@ start_runtime() {
     --memory 4G \
     --cpus 4 \
     --name "$NAME" \
-    --publish "127.0.0.1:$HOST_PORT:9334" \
     --mount "type=bind,source=$CHROME_DIR,target=/opt/chrome,readonly" \
     --tmpfs /tmp \
     --shm-size 1G \
     "$IMAGE" >/dev/null
+  local guest_ip=""
+  for _ in {1..100}; do
+    guest_ip="$(container_ipv4)"
+    [[ -n "$guest_ip" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$guest_ip" ]] || {
+    container logs "$NAME" | tail -80 >&2
+    printf 'ChromiumOS container did not receive a private IPv4 address\n' >&2
+    return 2
+  }
+  start_host_relay "$guest_ip"
   for _ in {1..200}; do
     endpoint_healthy && {
       printf '%s\n' "$ENDPOINT"
@@ -175,11 +279,13 @@ start_runtime() {
     sleep 0.1
   done
   container logs "$NAME" | tail -80 >&2
+  sed -n '1,80p' "$RELAY_LOG_FILE" >&2
   printf 'ChromiumOS CDP endpoint did not become healthy\n' >&2
   return 2
 }
 
 stop_runtime() {
+  stop_host_relay
   if container_exists; then
     container stop "$NAME" >/dev/null 2>&1 || true
     container rm "$NAME" >/dev/null

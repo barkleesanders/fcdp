@@ -123,10 +123,12 @@ fcdp raw <pageTargetId> SmartCardEmulation.enable
 ./fcdp-chromeos stop
 ```
 
-The launcher pins and SHA-256-verifies the official 1684555 artifact, binds its CDP
-relay only to `127.0.0.1`, mounts the Chrome binary read-only, and uses a tmpfs
-profile. It never opens or copies the real Default profile. The first install
-downloads about 304 MB and extracts about 907 MB.
+The launcher pins and SHA-256-verifies the official 1684555 artifact, mounts the
+Chrome binary read-only, and uses a tmpfs profile. A managed host relay binds only
+to `127.0.0.1` and forwards raw TCP to the container's private IPv4 address; this
+avoids Apple container's published-port proxy while keeping CDP off the LAN. It
+never opens or copies the real Default profile. The first install downloads about
+304 MB and extracts about 907 MB.
 
 The launcher remembers the first free loopback host port in the 9333-9399 range,
 so another local app cannot block startup by owning 9333. Set
