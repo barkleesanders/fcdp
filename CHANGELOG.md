@@ -19,3 +19,6 @@
   domains with positive and fake-domain negative controls.
 - Made `fcdp raw` return a nonzero status for CDP errors while preserving the JSON
   error response on stdout.
+- Made the ChromeOS transport remember the first free loopback port in 9333-9399,
+  with a fail-closed `FCDP_CHROMEOS_PORT` override, so an unrelated local listener
+  cannot block startup.

@@ -128,6 +128,11 @@ relay only to `127.0.0.1`, mounts the Chrome binary read-only, and uses a tmpfs
 profile. It never opens or copies the real Default profile. The first install
 downloads about 304 MB and extracts about 907 MB.
 
+The launcher remembers the first free loopback host port in the 9333-9399 range,
+so another local app cannot block startup by owning 9333. Set
+`FCDP_CHROMEOS_PORT=<port>` when a fixed port is required; startup fails closed if
+that explicit port is occupied.
+
 The complete matrix is:
 
 ```bash

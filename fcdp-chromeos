@@ -12,7 +12,13 @@ CHROME_DIR="$CACHE_BASE/chrome-chromeos"
 CHROME_BIN="$CHROME_DIR/chrome"
 IMAGE="fcdp-chromeos-runtime:${SNAPSHOT_REVISION}-v1"
 NAME="fcdp-chromeos"
-ENDPOINT="http://127.0.0.1:9333"
+PORT_FILE="$CACHE_BASE/host-port"
+HOST_PORT="${FCDP_CHROMEOS_PORT:-}"
+if [[ -z "$HOST_PORT" && -f "$PORT_FILE" ]]; then
+  HOST_PORT="$(<"$PORT_FILE")"
+fi
+HOST_PORT="${HOST_PORT:-9333}"
+ENDPOINT="http://127.0.0.1:$HOST_PORT"
 
 usage() {
   cat <<'EOF'
@@ -20,6 +26,8 @@ usage: fcdp-chromeos install|start|stop|status|verify|endpoint
 
 Runs the official Linux ChromiumOS Full snapshot in an isolated amd64 Apple
 container. The endpoint is loopback-only and never uses the real Chrome profile.
+Set FCDP_CHROMEOS_PORT to require a specific loopback host port. Otherwise the
+launcher remembers the first free port in the 9333-9399 range.
 EOF
 }
 
@@ -72,8 +80,61 @@ install_image() {
 }
 
 endpoint_healthy() {
-  curl -fsS "$ENDPOINT/json/protocol" 2>/dev/null | \
+  curl -fsS --connect-timeout 1 --max-time 2 "$ENDPOINT/json/protocol" 2>/dev/null | \
     jq -e 'any(.domains[]; .domain == "SmartCardEmulation")' >/dev/null
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535))
+}
+
+port_available() {
+  python3 - "$1" <<'PY'
+import socket
+import sys
+
+with socket.socket() as listener:
+    try:
+        listener.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError:
+        raise SystemExit(1)
+PY
+}
+
+set_host_port() {
+  HOST_PORT="$1"
+  ENDPOINT="http://127.0.0.1:$HOST_PORT"
+}
+
+select_host_port() {
+  require python3
+  valid_port "$HOST_PORT" || {
+    printf 'invalid ChromeOS host port: %s\n' "$HOST_PORT" >&2
+    return 2
+  }
+  if endpoint_healthy; then
+    return
+  fi
+  if port_available "$HOST_PORT"; then
+    mkdir -p "$CACHE_BASE"
+    printf '%s\n' "$HOST_PORT" >"$PORT_FILE"
+    return
+  fi
+  if [[ -n "${FCDP_CHROMEOS_PORT:-}" ]]; then
+    printf 'requested ChromeOS host port is already in use: %s\n' "$HOST_PORT" >&2
+    return 2
+  fi
+  local candidate
+  for candidate in {9333..9399}; do
+    if port_available "$candidate"; then
+      set_host_port "$candidate"
+      mkdir -p "$CACHE_BASE"
+      printf '%s\n' "$HOST_PORT" >"$PORT_FILE"
+      return
+    fi
+  done
+  printf 'no free ChromeOS loopback port found in 9333-9399\n' >&2
+  return 2
 }
 
 container_exists() {
@@ -84,6 +145,7 @@ container_exists() {
 start_runtime() {
   require jq
   require container
+  select_host_port
   if endpoint_healthy; then
     printf '%s\n' "$ENDPOINT"
     return
@@ -100,7 +162,7 @@ start_runtime() {
     --memory 4G \
     --cpus 4 \
     --name "$NAME" \
-    --publish 127.0.0.1:9333:9334 \
+    --publish "127.0.0.1:$HOST_PORT:9334" \
     --mount "type=bind,source=$CHROME_DIR,target=/opt/chrome,readonly" \
     --tmpfs /tmp \
     --shm-size 1G \
@@ -167,6 +229,7 @@ case "${1:-}" in
     verify_runtime
     ;;
   endpoint)
+    select_host_port
     printf '%s\n' "$ENDPOINT"
     ;;
   *)
