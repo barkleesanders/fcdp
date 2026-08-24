@@ -13,7 +13,7 @@ Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
   request : {id, tabId, method, params}   or  {op:"subscribe", filter, tabId}
   reply   : {id, result|error}            events pushed as {event, tabId, params}
 """
-import socket, struct, json, sys, os, base64, time, select, re
+import socket, struct, json, sys, os, base64, time, select, re, hashlib
 
 SOCK = "/tmp/fcdp.sock"
 # The active-tab cache is a SINGLE shared file by default, which is last-writer-wins.
@@ -22,7 +22,7 @@ SOCK = "/tmp/fcdp.sock"
 # mac-mini 2026-07-29 by watching the file change under two sequential opens.
 # FCDP_TAB_CACHE gives a job its own cache file so tabId-less commands stay scoped to
 # it — this is what `fcdp-job` sets, and what any concurrent cron should set.
-CACHE = os.path.expanduser(os.environ.get("FCDP_TAB_CACHE") or "~/.cache/fcdp-tab")
+CACHE_OVERRIDE = os.environ.get("FCDP_TAB_CACHE")
 
 # ---- direct-CDP transport (no extension, no bridge) ---------------------------
 # fcdp normally reaches Chrome through our MV3 extension + bridge, because Chrome
@@ -40,6 +40,7 @@ CACHE = os.path.expanduser(os.environ.get("FCDP_TAB_CACHE") or "~/.cache/fcdp-ta
 #   FCDP_CDP_URL=http://127.0.0.1:9222 fcdp tabs
 # Everything except the 5 bridge-only Meta.* calls is passed through untouched.
 CDP_URL = os.environ.get("FCDP_CDP_URL", "").rstrip("/")
+PIPE_SOCKET = os.path.expanduser(os.environ.get("FCDP_PIPE_SOCKET", ""))
 
 
 def _autodetect_cdp():
@@ -64,12 +65,27 @@ def _autodetect_cdp():
 # Resolve the transport EAGERLY. It must be known before argument parsing, because
 # tabId syntax differs per transport (bridge = chrome.tabs ints, direct = hex target
 # ids) and resolve_tid() runs long before the first Conn() is built.
-if not CDP_URL and not os.path.exists(SOCK):
+if not CDP_URL and not PIPE_SOCKET and not os.path.exists(SOCK):
     _found = _autodetect_cdp()
     if _found:
         CDP_URL = _found
         print("fcdp: no bridge socket; using direct CDP at %s (set FCDP_CDP_URL to pin it)"
               % _found, file=sys.stderr)
+
+# A bridge tab id is a chrome.tabs integer; a direct target id is an unrelated hex
+# string. Reusing one cache file made switching transports silently aim a command at
+# the wrong browser. Keep the historical bridge cache path, but namespace direct
+# caches by endpoint. FCDP_TAB_CACHE remains the explicit per-job override.
+if CACHE_OVERRIDE:
+    CACHE = os.path.expanduser(CACHE_OVERRIDE)
+elif CDP_URL or PIPE_SOCKET:
+    endpoint = CDP_URL or ("pipe:" + PIPE_SOCKET)
+    endpoint_key = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:12]
+    CACHE = os.path.expanduser("~/.cache/fcdp-tab-direct-%s" % endpoint_key)
+else:
+    CACHE = os.path.expanduser("~/.cache/fcdp-tab")
+
+BROWSER_TARGET = "browser"
 
 
 class DirectConn:
@@ -124,15 +140,22 @@ class DirectConn:
         return [t for t in self._http("/json/list") if t.get("type") == "page"]
 
     def _sock(self, tabId):
-        if tabId in self._ws:
-            return self._ws[tabId]
+        key = str(tabId)
+        if key in self._ws:
+            return self._ws[key]
         from websockets.sync.client import connect
-        tgt = next((t for t in self._pages() if str(t.get("id")) == str(tabId)), None)
-        if tgt is None:
-            die("no CDP target %s at %s (run `fcdp tabs` to list)" % (tabId, self.base))
-        ws = connect(tgt["webSocketDebuggerUrl"], open_timeout=20,
+        if key == BROWSER_TARGET:
+            ws_url = self._http("/json/version").get("webSocketDebuggerUrl")
+            if not ws_url:
+                die("CDP endpoint %s does not advertise a browser WebSocket" % self.base)
+        else:
+            tgt = next((t for t in self._pages() if str(t.get("id")) == key), None)
+            if tgt is None:
+                die("no CDP target %s at %s (run `fcdp tabs` to list)" % (tabId, self.base))
+            ws_url = tgt["webSocketDebuggerUrl"]
+        ws = connect(ws_url, open_timeout=20,
                      close_timeout=5, max_size=64 * 1024 * 1024)
-        self._ws[tabId] = ws
+        self._ws[key] = ws
         return ws
 
     def _next(self):
@@ -153,7 +176,7 @@ class DirectConn:
                 t = json.loads(r.read().decode("utf-8", "replace"))
             return {"result": {"tabId": t.get("id")}}
         if method == "Meta.closeTab":
-            self._ws.pop(tabId, None)   # drop the cached socket; the target is going away
+            self._ws.pop(str(tabId), None)  # drop the cached socket; target is going away
             return {"result": {"closed": True,
                                "note": self._http_text("/json/close/%s" % tabId)}}
         if method in ("Meta.attach", "Meta.detach"):
@@ -230,15 +253,16 @@ class DirectConn:
 class _BridgeConn:
     """One persistent Unix-socket connection to the bridge. Demuxes command
     replies (have `id`) from CDP events (have `event`)."""
-    def __init__(self, timeout=120):
-        if not os.path.exists(SOCK):
-            die("bridge socket %s not found — is the fcdp bridge running? (launchctl list | grep fcdp)" % SOCK)
+    def __init__(self, timeout=120, sock_path=SOCK):
+        self.sock_path = sock_path
+        if not os.path.exists(sock_path):
+            die("bridge socket %s not found — is its bridge running?" % sock_path)
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.s.settimeout(timeout)
         try:
-            self.s.connect(SOCK)
+            self.s.connect(sock_path)
         except Exception as e:
-            die("could not connect to bridge at %s (%s)" % (SOCK, e))
+            die("could not connect to bridge at %s (%s)" % (sock_path, e))
         self.buf = b""
         self.evq = []
         self._id = 0
@@ -323,10 +347,12 @@ class _BridgeConn:
 
 
 def Conn(timeout=120):
-    """Transport factory. CDP_URL set (env or startup auto-detect) -> raw CDP, no
-    extension/bridge needed; otherwise the MV3-extension bridge, which is the only
-    way to reach a real Default profile."""
-    return DirectConn(timeout) if CDP_URL else _BridgeConn(timeout)
+    """Select pipe, remote-debugging port, or real-profile extension transport."""
+    if PIPE_SOCKET:
+        return _BridgeConn(timeout, PIPE_SOCKET)
+    if CDP_URL:
+        return DirectConn(timeout)
+    return _BridgeConn(timeout)
 
 
 def die(msg, code=2):
@@ -384,7 +410,9 @@ def _is_tid(s):
     mistaken for a tabId when talking to the bridge."""
     if re.fullmatch(r"\d+", s):
         return True
-    return bool(CDP_URL) and bool(re.fullmatch(r"[0-9A-Fa-f]{16,}", s))
+    return bool(CDP_URL or PIPE_SOCKET) and (
+        s == BROWSER_TARGET or bool(re.fullmatch(r"[0-9A-Fa-f]{16,}", s))
+    )
 
 
 def resolve_tid(a, idx):
@@ -407,6 +435,16 @@ def resolve_tid(a, idx):
                          if x.get("type") == "page"]
             if pages:
                 t = pages[0].get("id")
+        except Exception:
+            pass
+    if t is None and PIPE_SOCKET:
+        try:
+            conn = _BridgeConn(5, PIPE_SOCKET)
+            reply = conn.cmd(None, "Meta.listTabs")
+            conn.close()
+            tabs = reply.get("result", {}).get("tabs", [])
+            if tabs:
+                t = tabs[0].get("tabId")
         except Exception:
             pass
     if t is None:
@@ -485,7 +523,9 @@ FULL-CDP POWER (the 4 domains ccb CANNOT do):
   fcdp intercept [tab] [secs]     Fetch.enable + reload; log & continue paused requests
   fcdp throttle [tab]             Network.emulateNetworkConditions Slow-3G
   fcdp trace [tab] [out.json]     Tracing.start/end -> trace file
-  fcdp raw [tab] <CDP.Method> ['<json>']   any CDP call
+  fcdp raw [tab] <CDP.Method> ['<json>']   any page-target CDP call
+  fcdp raw --browser <CDP.Method> ['<json>']
+                                  browser-target call (direct mode only)
   fcdp attach|detach [tab]
 
 tabId is optional everywhere (omit to use the last `fcdp open`ed tab).
@@ -587,10 +627,25 @@ def main():
         conn.close(); show(r); return
 
     if c == "raw":
-        tid, rest = resolve_tid(a, 1)
+        if len(a) > 1 and a[1] == "--browser":
+            if not (CDP_URL or PIPE_SOCKET):
+                die(
+                    "raw --browser requires direct mode (set FCDP_CDP_URL or "
+                    "FCDP_PIPE_SOCKET). "
+                    "Stock Chrome's extension API intentionally withholds browser-level "
+                    "and privileged domains from the real Default profile."
+                )
+            tid, rest = BROWSER_TARGET, a[2:]
+        else:
+            tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp raw [tab|--browser] <CDP.Method> ['<json>']")
         method = rest[0]; params = json.loads(rest[1]) if len(rest) > 1 else {}
         conn = Conn(); r = conn.cmd(tid, method, params); conn.close()
-        show(r); return
+        show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
 
     if c == "js":
         tid, rest = resolve_tid(a, 1)

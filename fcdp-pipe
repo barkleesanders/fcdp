@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOCKET="${FCDP_PIPE_SOCKET:-/tmp/fcdp-pipe.sock}"
+PIDFILE="${FCDP_PIPE_PIDFILE:-$HOME/.cache/fcdp-pipe.pid}"
+LOG="${FCDP_PIPE_LOG:-$HOME/.cache/fcdp-pipe.log}"
+PROFILE="${FCDP_PIPE_PROFILE:-$HOME/.cache/fcdp-pipe-profile}"
+
+alive() {
+  [[ -s "$PIDFILE" ]] || return 1
+  local pid command_line
+  pid="$(sed -n '1p' "$PIDFILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$command_line" == *fcdp-pipe.mjs* ]]
+}
+
+socket_live() {
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(.25); s.connect(sys.argv[1]); s.close()' "$SOCKET" 2>/dev/null
+}
+
+case "${1:-}" in
+  run)
+    shift
+    exec node "$ROOT/fcdp-pipe.mjs" --socket "$SOCKET" --profile "$PROFILE" "$@"
+    ;;
+  start)
+    shift
+    if alive; then
+      printf 'fcdp-pipe already running (pid %s)\n' "$(sed -n '1p' "$PIDFILE")"
+      exit 0
+    fi
+    unlink "$PIDFILE" 2>/dev/null || true
+    if [[ -e "$SOCKET" ]]; then
+      if [[ -S "$SOCKET" ]]; then
+        if socket_live; then
+          printf 'refusing to replace active socket without a matching pid: %s\n' "$SOCKET" >&2
+          exit 2
+        fi
+        unlink "$SOCKET"
+      else
+        printf 'refusing to replace non-socket path: %s\n' "$SOCKET" >&2
+        exit 2
+      fi
+    fi
+    mkdir -p "$(dirname "$PIDFILE")" "$(dirname "$LOG")" "$PROFILE"
+    chmod 700 "$PROFILE"
+    nohup node "$ROOT/fcdp-pipe.mjs" --socket "$SOCKET" --profile "$PROFILE" "$@" >"$LOG" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" >"$PIDFILE"
+    for _ in {1..100}; do
+      [[ -S "$SOCKET" ]] && break
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ ! -S "$SOCKET" ]]; then
+      printf 'fcdp-pipe failed to start; see %s\n' "$LOG" >&2
+      exit 1
+    fi
+    printf 'fcdp-pipe started (pid %s, socket %s)\n' "$pid" "$SOCKET"
+    ;;
+  stop)
+    if ! alive; then
+      printf 'fcdp-pipe is not running\n' >&2
+      exit 1
+    fi
+    pid="$(sed -n '1p' "$PIDFILE")"
+    command_line="$(ps -p "$pid" -o command=)"
+    case "$command_line" in
+      *fcdp-pipe.mjs*) ;;
+      *) printf 'refusing to stop unexpected pid %s: %s\n' "$pid" "$command_line" >&2; exit 2 ;;
+    esac
+    kill "$pid"
+    for _ in {1..100}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    unlink "$PIDFILE" 2>/dev/null || true
+    printf 'fcdp-pipe stopped\n'
+    ;;
+  status)
+    if alive; then
+      printf 'fcdp-pipe running (pid %s, socket %s)\n' "$(sed -n '1p' "$PIDFILE")" "$SOCKET"
+    else
+      printf 'fcdp-pipe not running\n'
+      exit 1
+    fi
+    ;;
+  *)
+    printf 'usage: fcdp-pipe {start|run|stop|status} [--chrome /path/to/chrome] [--verbose]\n' >&2
+    exit 64
+    ;;
+esac

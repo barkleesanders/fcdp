@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SNAPSHOT_REVISION=1684555
+SNAPSHOT_SHA256=7a4b12c5aa91073e17cbca4805f6dc037537692329e050d3e0158c7454652762
+SNAPSHOT_SIZE=304296495
+SNAPSHOT_URL="https://storage.googleapis.com/chromium-browser-snapshots/Linux_ChromiumOS_Full/${SNAPSHOT_REVISION}/chrome-chromeos.zip"
+CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/fcdp-chromeos/${SNAPSHOT_REVISION}"
+ARCHIVE="$CACHE_BASE/chrome-chromeos.zip"
+CHROME_DIR="$CACHE_BASE/chrome-chromeos"
+CHROME_BIN="$CHROME_DIR/chrome"
+IMAGE="fcdp-chromeos-runtime:${SNAPSHOT_REVISION}-v1"
+NAME="fcdp-chromeos"
+ENDPOINT="http://127.0.0.1:9333"
+
+usage() {
+  cat <<'EOF'
+usage: fcdp-chromeos install|start|stop|status|verify|endpoint
+
+Runs the official Linux ChromiumOS Full snapshot in an isolated amd64 Apple
+container. The endpoint is loopback-only and never uses the real Chrome profile.
+EOF
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    printf 'required command not found: %s\n' "$1" >&2
+    exit 2
+  }
+}
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+archive_valid() {
+  [[ -f "$ARCHIVE" ]] || return 1
+  [[ "$(stat -f '%z' "$ARCHIVE")" == "$SNAPSHOT_SIZE" ]] || return 1
+  [[ "$(sha256_file "$ARCHIVE")" == "$SNAPSHOT_SHA256" ]]
+}
+
+install_snapshot() {
+  require curl
+  require shasum
+  require unzip
+  mkdir -p "$CACHE_BASE"
+  if ! archive_valid; then
+    local partial="$ARCHIVE.partial"
+    curl -fL --retry 3 --output "$partial" "$SNAPSHOT_URL"
+    if [[ "$(stat -f '%z' "$partial")" != "$SNAPSHOT_SIZE" ]] || \
+       [[ "$(sha256_file "$partial")" != "$SNAPSHOT_SHA256" ]]; then
+      printf 'ChromiumOS snapshot failed size or SHA-256 verification\n' >&2
+      return 2
+    fi
+    mv "$partial" "$ARCHIVE"
+  fi
+  if [[ ! -x "$CHROME_BIN" ]]; then
+    unzip -q -o "$ARCHIVE" -d "$CACHE_BASE"
+  fi
+  [[ -x "$CHROME_BIN" ]] || {
+    printf 'ChromiumOS archive did not contain executable chrome\n' >&2
+    return 2
+  }
+}
+
+install_image() {
+  require container
+  if ! container image inspect "$IMAGE" >/dev/null 2>&1; then
+    container build --arch amd64 --tag "$IMAGE" --file "$ROOT/Containerfile.chromeos" "$ROOT"
+  fi
+}
+
+endpoint_healthy() {
+  curl -fsS "$ENDPOINT/json/protocol" 2>/dev/null | \
+    jq -e 'any(.domains[]; .domain == "SmartCardEmulation")' >/dev/null
+}
+
+container_exists() {
+  container ls -a --format json | jq -e --arg name "$NAME" \
+    'any(.[]; .configuration.id == $name)' >/dev/null
+}
+
+start_runtime() {
+  require jq
+  require container
+  if endpoint_healthy; then
+    printf '%s\n' "$ENDPOINT"
+    return
+  fi
+  install_snapshot
+  install_image
+  if container_exists; then
+    container stop "$NAME" >/dev/null 2>&1 || true
+    container rm "$NAME" >/dev/null
+  fi
+  container run --detach \
+    --arch amd64 \
+    --rosetta \
+    --memory 4G \
+    --cpus 4 \
+    --name "$NAME" \
+    --publish 127.0.0.1:9333:9334 \
+    --mount "type=bind,source=$CHROME_DIR,target=/opt/chrome,readonly" \
+    --tmpfs /tmp \
+    --shm-size 1G \
+    "$IMAGE" >/dev/null
+  for _ in {1..200}; do
+    endpoint_healthy && {
+      printf '%s\n' "$ENDPOINT"
+      return
+    }
+    sleep 0.1
+  done
+  container logs "$NAME" | tail -80 >&2
+  printf 'ChromiumOS CDP endpoint did not become healthy\n' >&2
+  return 2
+}
+
+stop_runtime() {
+  if container_exists; then
+    container stop "$NAME" >/dev/null 2>&1 || true
+    container rm "$NAME" >/dev/null
+  fi
+}
+
+verify_runtime() {
+  start_runtime >/dev/null
+  local tab
+  tab="$(FCDP_CDP_URL="$ENDPOINT" "$ROOT/fcdp" tabs | awk '$2 == "about:blank" {print $1; exit}')"
+  [[ -n "$tab" ]] || {
+    printf 'ChromiumOS runtime exposed no about:blank page target\n' >&2
+    return 2
+  }
+  FCDP_CDP_URL="$ENDPOINT" "$ROOT/fcdp" raw "$tab" SmartCardEmulation.enable >/dev/null
+  FCDP_CDP_URL="$ENDPOINT" "$ROOT/fcdp" raw "$tab" SmartCardEmulation.disable >/dev/null
+  if FCDP_CDP_URL="$ENDPOINT" "$ROOT/fcdp" raw "$tab" DefinitelyNotACdpDomain.nope \
+      >/dev/null 2>&1; then
+    printf 'negative control unexpectedly succeeded\n' >&2
+    return 2
+  fi
+  curl -fsS "$ENDPOINT/json/version" | jq '{Browser, userAgent:."User-Agent", protocolVersion:."Protocol-Version"}'
+  printf 'SmartCardEmulation page-target dispatch: pass\n'
+  printf 'fake-domain negative control: pass\n'
+}
+
+case "${1:-}" in
+  install)
+    install_snapshot
+    install_image
+    ;;
+  start)
+    start_runtime
+    ;;
+  stop)
+    stop_runtime
+    ;;
+  status)
+    if endpoint_healthy; then
+      curl -fsS "$ENDPOINT/json/version" | jq '{Browser, userAgent:."User-Agent"}'
+    else
+      printf 'stopped\n'
+      exit 1
+    fi
+    ;;
+  verify)
+    verify_runtime
+    ;;
+  endpoint)
+    printf '%s\n' "$ENDPOINT"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
