@@ -28,15 +28,23 @@ verification.
 3. Start the bridge: `node <repo>/bridge.mjs`. On macOS prefer the launchd agent so it
    survives reboot — but the shipped plist hardcodes the author's home directory, so you
    MUST rewrite the paths for this machine before loading it:
+     P=~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
      sed "s|/Users/barkleesanders/tools/fcdp|$HOME/tools/fcdp|g" \
-       <repo>/com.barklee.fcdp-bridge.plist > ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
-     plutil -lint ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
-     launchctl load ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
-     launchctl list | grep fcdp
-   Substitute the real repo path if you cloned elsewhere. Confirm it is listening on
-   ws://127.0.0.1:9871 and that /tmp/fcdp.sock exists — a plist with the wrong path
-   loads without error and simply never runs, so check for the socket, not the exit code.
-   If port 9871 is taken, change PORT in BOTH bridge.mjs and extension/background.js.
+       <repo>/com.barklee.fcdp-bridge.plist > "$P"
+     # ASSERT the substitution actually happened — this is the check that matters:
+     grep -q barkleesanders "$P" && echo "STILL HARDCODED - do not load this" || echo "paths ok"
+     launchctl load "$P"
+   Substitute the real repo path if you cloned elsewhere, and adjust the sed if your
+   clone is not at $HOME/tools/fcdp.
+
+   Do NOT use `plutil -lint` as your check here. It validates XML syntax only — it
+   returns OK on a plist whose ProgramArguments point at a file that does not exist
+   (verified). Likewise `launchctl load` and `launchctl list` succeed for a plist that
+   can never run. The only real proof is this:
+     test -S /tmp/fcdp.sock && echo "bridge up" || echo "bridge NOT running"
+   If that socket does not exist, the bridge is not running regardless of what
+   launchctl reported. If port 9871 is taken, change PORT in BOTH bridge.mjs and
+   extension/background.js.
 
 4. STOP. This step is mine, not yours — you cannot automate it and should not try.
    `--load-extension` is inert on Chrome 149+, and the CDP loadUnpacked path needs
