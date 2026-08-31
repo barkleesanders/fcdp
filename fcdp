@@ -385,6 +385,26 @@ def result_or_die(r, what):
     return r.get("result", {}) if isinstance(r, dict) else r
 
 
+def _canon_url(u):
+    """Apply Chrome's OWN canonicalization so `open --reuse` can compare exactly.
+
+    Chrome reports a path-less url with the path filled in: `fcdp open https://example.com`
+    produces a tab whose url is `https://example.com/`. A raw string compare therefore never
+    matches the very case people type, and reuse would silently never fire. This normalizes
+    ONLY that — it does not lowercase, strip queries/fragments, or collapse a real trailing
+    slash (`/a/` vs `/a` stay different), because matching two different pages would navigate
+    a tab the caller never asked about.
+    """
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+        s = urlsplit(u)
+        if s.scheme in ("http", "https") and s.netloc and s.path == "":
+            return urlunsplit((s.scheme, s.netloc, "/", s.query, s.fragment))
+    except Exception:
+        pass
+    return u
+
+
 # ---- tab cache so tabId is optional on every command --------------------------
 def save_tab(tid):
     try:
@@ -497,7 +517,10 @@ HELP = """fcdp - ONE CLI for your REAL Chrome (our MV3 extension via chrome.debu
 
 TABS / NAV:
   fcdp tabs                       list tabs -> tabId,url,title
-  fcdp open <url> [--bg]          open a NEW tab (cached as active); --bg = background
+  fcdp open <url> [--bg] [--reuse]  open a NEW tab (cached as active); --bg = background
+                                  --reuse: if a tab already has this exact url,
+                                  Page.navigate it instead of opening a duplicate
+                                  (ignored with --bg, which always creates)
   fcdp nav [tab] <url>            navigate the tab
   fcdp close [tab]                close the tab
 
@@ -577,13 +600,46 @@ def main():
     if c == "open":
         url = None
         bg = "--bg" in a
+        reuse = "--reuse" in a
         for x in a[1:]:
-            if x != "--bg":
+            if x not in ("--bg", "--reuse"):
                 url = x; break
         url = url or "about:blank"
         conn = Conn()
         tabs_before = result_or_die(conn.cmd(None, "Meta.listTabs"), "Meta.listTabs").get("tabs", [])
         before = {t["tabId"] for t in tabs_before}
+        # --reuse: `open` has ALWAYS created a new tab, so an agent that opens the same
+        # page across a long session accumulates duplicates monotonically (a real profile
+        # reached 139 tabs / 35 exact dupes — one report open 6x). tabs_before already
+        # carries every tab's url; we were only diffing its ids. Opt-in, because crons and
+        # scripts depend on bare `open` creating a tab every time.
+        #
+        # Page.navigate, NOT a bare activate: re-opening the same file:// URL after
+        # regenerating the file must show the NEW bytes. Activating a stale tab is exactly
+        # the false-verification bug this flag exists to avoid — and Meta has no activate
+        # op anyway (the extension implements listTabs/attach/detach/createTab/closeTab,
+        # nothing else). Checked BEFORE Meta.createTab, so neither create path — native or
+        # the window.open fallback below — can run once a match is found.
+        #
+        # KNOWN LIMIT (measured, not theoretical): chrome.tabs reports a tab whose
+        # navigation has not COMMITTED yet with an empty/pending url, so a --reuse issued
+        # within ~1s of opening that same url on a cold load finds no match and creates a
+        # second tab. Matching the pending url would need a field Meta.listTabs does not
+        # send, and this stays CLI-side by design. Harmless for the actual case (a tab
+        # opened earlier is long committed); do not "fix" it with a sleep here.
+        if reuse and not bg:
+            want = _canon_url(url)
+            hit = next((t for t in tabs_before
+                        if _canon_url(t.get("url") or "") == want), None)
+            if hit:
+                tid = hit["tabId"]
+                conn.cmd(tid, "Page.enable")
+                r = conn.cmd(tid, "Page.navigate", {"url": url})
+                conn.close()
+                result_or_die(r, "Page.navigate")
+                save_tab(tid)
+                print("reused tab %s (cached active, re-navigated)" % tid)
+                return
         # Prefer the native chrome.tabs op (active once the extension is reloaded);
         # else fall back to window.open on an existing tab — pure CDP, no reload needed.
         r = conn.cmd(None, "Meta.createTab", {"url": url, "active": not bg})
