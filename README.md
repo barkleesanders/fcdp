@@ -6,6 +6,61 @@ permission. `chrome.debugger.sendCommand(target, method, params)` accepts **any*
 method, so this reaches the domains a curated tool like `ccb` cannot:
 **Fetch interception, Emulation/throttling, Tracing, Page.printToPDF.**
 
+## Quick start — paste this into your coding agent
+
+Copy the whole block below into Claude Code, Codex, Cursor, or any agent that can run
+shell commands. It installs fcdp the way it is actually run in production, stops at the
+one step Chrome will not let a script do, and refuses to claim success without proof.
+
+```
+Set up fcdp (github.com/barkleesanders/fcdp) on this machine so I can drive my REAL
+logged-in Chrome from the CLI. Work through these steps in order and do not skip the
+verification.
+
+1. Clone to ~/tools/fcdp (or tell me where you put it), then `npm install` there.
+   Its only dependency is `ws`.
+
+2. Read SECURITY.md and summarise the threat model back to me in two sentences BEFORE
+   you start the bridge. Short version you must confirm you understood: the bridge
+   currently has NO authentication on either transport, so any process running as my
+   user can drive my logged-in browser. Ask me to confirm I want to proceed.
+
+3. Start the bridge: `node <repo>/bridge.mjs`. On macOS prefer the launchd agent so it
+   survives reboot — but the shipped plist hardcodes the author's home directory, so you
+   MUST rewrite the paths for this machine before loading it:
+     sed "s|/Users/barkleesanders/tools/fcdp|$HOME/tools/fcdp|g" \
+       <repo>/com.barklee.fcdp-bridge.plist > ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
+     plutil -lint ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
+     launchctl load ~/Library/LaunchAgents/com.barklee.fcdp-bridge.plist
+     launchctl list | grep fcdp
+   Substitute the real repo path if you cloned elsewhere. Confirm it is listening on
+   ws://127.0.0.1:9871 and that /tmp/fcdp.sock exists — a plist with the wrong path
+   loads without error and simply never runs, so check for the socket, not the exit code.
+   If port 9871 is taken, change PORT in BOTH bridge.mjs and extension/background.js.
+
+4. STOP. This step is mine, not yours — you cannot automate it and should not try.
+   `--load-extension` is inert on Chrome 149+, and the CDP loadUnpacked path needs
+   --remote-debugging-port, which Chrome 136+ refuses on the default profile. Walk me
+   through it and wait:
+     a. Open chrome://extensions
+     b. Toggle Developer mode ON (top right)
+     c. Click "Load unpacked" and select the `extension/` folder in the repo
+   This is one-time. Chrome records it in Secure Preferences and reloads it on every
+   launch as long as that folder keeps existing.
+
+5. Verify for real. Run `~/tools/fcdp/fcdp tabs`. A working install prints actual
+   integer tab IDs from my live browser. If it prints nothing, errors, or you cannot
+   run it, say the setup FAILED and show me bridge.log — do not report success from
+   "the bridge started" alone, and do not infer it worked from the absence of an error.
+
+6. Prove it end to end: `~/tools/fcdp/fcdp open https://example.com` then
+   `~/tools/fcdp/fcdp text` and show me the page text you got back.
+
+Then tell me: which tab IDs you saw, and one command I should try next. Note that only
+one debugger client can attach per tab, so if a tab is already driven by DevTools or
+another extension, fcdp will refuse it — use a fresh tab.
+```
+
 ## Components
 - `extension/` — MV3 extension (`"debugger"` perm). Service worker connects OUT to the
   bridge over `ws://127.0.0.1:9871`, runs CDP via `chrome.debugger`, forwards events.
