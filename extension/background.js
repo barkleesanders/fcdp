@@ -10,17 +10,29 @@
 //                   {id, method:"Meta.listTabs"}           list tabs
 //                   {id, tabId, method:"Meta.attach"}      attach debugger
 //                   {id, tabId, method:"Meta.detach"}      detach debugger
+//                   {id, method:"Meta.setProfileLabel", params:{label}}
+//                                                          persist this profile's label
 //                   {ping:true}                            keepalive (no reply)
 //   ext -> bridge:  {id, result} | {id, error}             command reply
 //                   {event:"Domain.method", tabId, params} CDP event (unsolicited)
-//                   {hello:true, ...}                       on (re)connect
+//                   {hello:true, profileLabel, tabSample, attached}  on (re)connect
+//
+// Multi-profile identity: the SAME extension can be loaded in several Chrome
+// profiles at once. Each profile's instance persists a label — its Chrome
+// profile directory name ("Profile 1", "Profile 2", ...) — in
+// chrome.storage.local, set once at install time via Meta.setProfileLabel
+// (see `fcdp label`), and reports it in hello so the bridge can route
+// profile-targeted commands deterministically. Unlabeled instances still
+// serve tab-owned commands, but are never chosen as a profile target.
 
 const PORT = 9871;
 const URL = "ws://127.0.0.1:" + PORT;
 const DBG_VERSION = "1.3";
+const LABEL_KEY = "fcdpProfileLabel";
 
 let ws = null;
 let attached = new Set(); // tabIds we've attached to
+let profileLabel = null; // this profile's label, once set/loaded
 
 function log(...a) { console.log("[fcdp]", ...a); }
 
@@ -28,6 +40,24 @@ function send(obj) {
   try {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   } catch (e) { log("send failed", e && e.message); }
+}
+
+async function loadLabel() {
+  try {
+    const o = await chrome.storage.local.get(LABEL_KEY);
+    if (o && o[LABEL_KEY]) profileLabel = o[LABEL_KEY];
+  } catch (e) { /* storage unavailable: stay unlabeled */ }
+  return profileLabel;
+}
+
+async function sendHello() {
+  await loadLabel();
+  let tabSample = [];
+  try {
+    const tabs = await new Promise((res) => chrome.tabs.query({}, res));
+    tabSample = (tabs || []).slice(0, 5).map((t) => ({ url: t.url, title: t.title, windowId: t.windowId }));
+  } catch (e) { /* sample helps the operator tell profiles apart; never load-bearing */ }
+  send({ hello: true, profileLabel, tabSample, attached: [...attached] });
 }
 
 function connect() {
@@ -41,7 +71,7 @@ function connect() {
   }
   ws.onopen = () => {
     log("connected to bridge", URL);
-    send({ hello: true, attached: [...attached] });
+    sendHello();
   };
   ws.onclose = () => { log("bridge closed; reconnecting"); ws = null; setTimeout(connect, 1000); };
   ws.onerror = () => { /* onclose will follow */ };
@@ -112,6 +142,20 @@ async function handle(data) {
         tabId: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId
       }));
       return send({ id, result: { tabs: slim, attached: [...attached] } });
+    }
+    if (method === "Meta.setProfileLabel") {
+      // One-time setup (via `fcdp label`): persist this profile's directory
+      // name as its bridge identity. Stored per-profile in chrome.storage.local,
+      // so the label survives restarts and is reported in every hello.
+      const lbl = ((params || {}).label || "").trim();
+      if (!lbl) throw new Error("Meta.setProfileLabel requires params.label");
+      await chrome.storage.local.set({ [LABEL_KEY]: lbl });
+      profileLabel = lbl;
+      return send({ id, result: { labeled: true, profileLabel: lbl } });
+    }
+    if (method === "Meta.whoami") {
+      await loadLabel();
+      return send({ id, result: { profileLabel } });
     }
     if (method === "Meta.attach") {
       await ensureAttached(tabId);

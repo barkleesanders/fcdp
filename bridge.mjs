@@ -10,17 +10,31 @@
 // Routing model:
 //   * Meta.listTabs (no tabId)  -> BROADCAST to every profile, MERGE the tab lists
 //     back to the CLI as one result. Tab ids are globally unique across profiles.
+//     Each merged tab is tagged with its owning connection's profile label.
 //   * command WITH a tabId      -> route to the profile that OWNS that tab (learned
 //     from listTabs replies, hello.attached, CDP events, and prior routes). If the
 //     owner is unknown, RACE the command to all profiles and return the one success
 //     (exactly one profile has the tab; the rest error), caching the winner.
 //   * no-tabId meta (Meta.createTab, ...) -> route to the ACTIVE profile (the one
-//     whose window currently holds an active tab), else the first connected profile.
+//     whose window currently holds an active tab), else the first connected profile
+//     — UNLESS the request carries `profile`, in which case it routes to the
+//     connection that claimed that label, or errors if none did.
+//
+// Profile labels: each extension instance persists a label — its Chrome profile
+// directory name ("Profile 1", "Profile 2", ...) — and reports it in hello. The
+// bridge records one label per connection and REJECTS a duplicate claim from a
+// second live connection (a mislabeled profile must fail loud, never silently
+// receive another profile's commands). Unlabeled connections serve tab-owned
+// commands but are never a profile target; the CLI's create/open path always
+// names a profile explicitly (default "Profile 1").
 //
 // CLI -> bridge frames (JSON):
-//   {id, tabId, method, params}          run a CDP command (or Meta.* op)
+//   {id, tabId, method, params, profile?}  run a CDP command (or Meta.* op)
 //   {op:"subscribe", filter:[...], tabId} route matching events to THIS socket
 //   {op:"unsubscribe"}                    stop routing events
+//   {op:"listProfiles", id}               connection table (labels, tab samples)
+//   {op:"setLabel", id, conn, label}      ask one connection's extension to
+//                                         persist a profile label (setup only)
 // bridge -> CLI frames:
 //   {id, result} | {id, error}           command reply
 //   {event:"Domain.method", tabId, params} pushed CDP event (to subscribers)
@@ -34,6 +48,8 @@ const SOCK = '/tmp/fcdp.sock';
 
 const conns = new Set(); // Set<WebSocket> — one per connected profile
 const connTabs = new Map(); // WebSocket -> Set<tabId> owned by that profile
+const connLabel = new Map(); // WebSocket -> profile label claimed in hello (or null)
+const connTabDetails = new Map(); // WebSocket -> last listTabs detail rows for that profile
 const tabOwner = new Map(); // tabId -> WebSocket that owns it
 let activeConn = null; // profile whose window last reported an active tab
 const pending = new Map(); // extId -> {kind, ...} outstanding ext request
@@ -61,6 +77,13 @@ function ownerSet(ws, tabId) {
 function ownerOf(tabId) {
   const ws = tabOwner.get(tabId);
   return ws && ws.readyState === 1 ? ws : null;
+}
+function labelOf(ws) {
+  return connLabel.get(ws) || `unlabeled#${ws._id}`;
+}
+function connByLabel(label) {
+  for (const ws of liveConns()) if (connLabel.get(ws) === label) return ws;
+  return null;
 }
 function liveConns() {
   return [...conns].filter((c) => c.readyState === 1);
@@ -95,6 +118,8 @@ wss.on('connection', (sock) => {
       for (const t of s) if (tabOwner.get(t) === sock) tabOwner.delete(t);
       connTabs.delete(sock);
     }
+    connLabel.delete(sock);
+    connTabDetails.delete(sock);
     if (activeConn === sock) activeConn = null;
     log(`ext#${sock._id} disconnected (${conns.size} left)`);
   });
@@ -103,7 +128,26 @@ wss.on('connection', (sock) => {
 
 function onExtMessage(ws, msg) {
   if (msg.hello) {
-    log(`ext#${ws._id} hello; attached tabs:`, msg.attached);
+    const claimed = typeof msg.profileLabel === 'string' && msg.profileLabel ? msg.profileLabel : null;
+    if (claimed) {
+      const holder = connByLabel(claimed);
+      if (holder && holder !== ws) {
+        // Duplicate label: two live profiles claiming one identity. Refuse the
+        // claim — this connection stays unlabeled so profile-targeted commands
+        // can never reach the wrong profile through it.
+        log(`ext#${ws._id} hello REJECTED label "${claimed}" — already held by ext#${holder._id}; connection stays unlabeled`);
+        connLabel.set(ws, null);
+      } else {
+        connLabel.set(ws, claimed);
+        log(`ext#${ws._id} hello; profile label: ${claimed}; attached tabs:`, msg.attached);
+      }
+    } else {
+      if (!connLabel.has(ws)) connLabel.set(ws, null);
+      log(`ext#${ws._id} hello; no profile label; attached tabs:`, msg.attached);
+    }
+    if (Array.isArray(msg.tabSample)) {
+      connTabDetails.set(ws, msg.tabSample.map((t) => ({ url: t.url, title: t.title, windowId: t.windowId })));
+    }
     if (Array.isArray(msg.attached)) for (const t of msg.attached) ownerSet(ws, t);
     return;
   }
@@ -119,6 +163,13 @@ function onExtMessage(ws, msg) {
 
   if (p.kind === 'single') {
     if (p.tabId != null) ownerSet(ws, p.tabId);
+    if (p.method === 'Meta.setProfileLabel' && msg.result && msg.result.profileLabel) {
+      const holder = connByLabel(msg.result.profileLabel);
+      if (!holder || holder === ws) {
+        connLabel.set(ws, msg.result.profileLabel);
+        log(`ext#${ws._id} labeled "${msg.result.profileLabel}" via Meta.setProfileLabel`);
+      }
+    }
     if (p.method === 'Meta.createTab' && msg.result && msg.result.tabId != null) {
       ownerSet(ws, msg.result.tabId);
       activeConn = ws;
@@ -129,8 +180,9 @@ function onExtMessage(ws, msg) {
   if (p.kind === 'agg') {
     const agg = p.agg;
     if (msg.result && Array.isArray(msg.result.tabs)) {
+      connTabDetails.set(ws, msg.result.tabs.map((t) => ({ tabId: t.tabId, url: t.url, title: t.title, windowId: t.windowId })));
       for (const t of msg.result.tabs) {
-        agg.tabs.push(t);
+        agg.tabs.push({ ...t, profile: labelOf(ws) });
         ownerSet(ws, t.tabId);
         if (t.active) activeConn = ws;
       }
@@ -226,6 +278,26 @@ function onCliMessage(sock, req) {
     subscribers.delete(sock);
     return frameSend(sock, { ok: true });
   }
+  if (req.op === 'listProfiles') {
+    // Answered by the bridge itself from its connection table — no extension
+    // round-trip. tabSample comes from hello / the last listTabs per profile.
+    const profiles = liveConns().map((ws) => ({
+      conn: ws._id,
+      label: connLabel.get(ws) || null,
+      tabCount: (connTabs.get(ws) || new Set()).size,
+      tabSample: (connTabDetails.get(ws) || []).slice(0, 5),
+    }));
+    return frameSend(sock, { id: req.id, result: { profiles } });
+  }
+  if (req.op === 'setLabel') {
+    const target = liveConns().find((ws) => ws._id === req.conn);
+    if (!target)
+      return frameSend(sock, { id: req.id, error: { message: `no live connection #${req.conn} (see listProfiles)` } });
+    const holder = connByLabel(req.label);
+    if (holder && holder !== target)
+      return frameSend(sock, { id: req.id, error: { message: `label "${req.label}" already held by connection #${holder._id}` } });
+    return relay(target, sock, { id: req.id, method: 'Meta.setProfileLabel', params: { label: req.label } });
+  }
 
   const cliId = req.id;
   if (liveConns().length === 0) {
@@ -238,8 +310,18 @@ function onCliMessage(sock, req) {
     });
   }
 
-  // Broadcast tab listing across every profile, merged into one reply.
+  // Broadcast tab listing across every profile, merged into one reply —
+  // or, with an explicit profile, just that profile's tabs.
   if (req.method === 'Meta.listTabs') {
+    if (req.profile) {
+      const target = connByLabel(req.profile);
+      if (!target)
+        return frameSend(sock, {
+          id: cliId,
+          error: { message: `no connected profile labeled "${req.profile}" (run \`fcdp profiles\`)` },
+        });
+      return broadcastListTabs(sock, cliId, [target]);
+    }
     return broadcastListTabs(sock, cliId);
   }
 
@@ -250,7 +332,17 @@ function onCliMessage(sock, req) {
     return raceRoute(sock, req); // owner unknown -> try all, return the one success
   }
 
-  // No-tabId meta command (Meta.createTab, ...) -> active/first profile.
+  // No-tabId meta command (Meta.createTab, ...) -> the explicitly named
+  // profile when the request carries one, else active/first profile.
+  if (req.profile) {
+    const target = connByLabel(req.profile);
+    if (!target)
+      return frameSend(sock, {
+        id: cliId,
+        error: { message: `no connected profile labeled "${req.profile}" (run \`fcdp profiles\`)` },
+      });
+    return relay(target, sock, req);
+  }
   const target = defaultConn();
   if (!target)
     return frameSend(sock, { id: cliId, error: { message: 'no connected profile available' } });
@@ -278,8 +370,8 @@ function relay(ws, cliSock, req) {
   }, 60000);
 }
 
-function broadcastListTabs(cliSock, cliId) {
-  const targets = liveConns();
+function broadcastListTabs(cliSock, cliId, only = null) {
+  const targets = only || liveConns();
   const agg = { cliSock, cliId, remaining: targets.length, tabs: [], attached: [], done: false };
   agg._timer = setTimeout(() => finalizeAgg(agg), 6000);
   for (const ws of targets) {

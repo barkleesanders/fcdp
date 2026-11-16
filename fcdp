@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """fcdp - most of the Chrome DevTools Protocol from the CLI, via our OWN MV3 extension.
 
-ONE tool for everything on your REAL Default profile: everyday driving
+ONE tool for everything on your REAL Chrome profiles: everyday driving
 (open/nav/read/find/click/type/fill/key/scroll/shot/wait/js/text) AND the four
 advanced domains ccb cannot do (pdf/intercept/throttle/trace) — all through
 chrome.debugger.sendCommand, which accepts ANY CDP method.
+
+MULTI-PROFILE: the extension can be loaded in several Chrome profiles at once.
+Each instance carries a profile label (its Chrome directory name, e.g.
+"Profile 1"); the bridge routes by label. `fcdp open` targets Profile 1 unless
+--profile says otherwise; tabId commands route to the owning profile
+automatically. `fcdp profiles` lists the connected, labeled profiles.
 
 tabId is OPTIONAL on every command: `fcdp open <url>` caches the new tab in
 ~/.cache/fcdp-tab; omit tabId to use it, or pass it explicitly as the first arg.
 
 Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
-  request : {id, tabId, method, params}   or  {op:"subscribe", filter, tabId}
+  request : {id, tabId, method, params, profile?}
+            or  {op:"subscribe"|"listProfiles"|"setLabel", ...}
   reply   : {id, result|error}            events pushed as {event, tabId, params}
 """
 import socket, struct, json, sys, os, base64, time, select, re, hashlib
@@ -162,7 +169,9 @@ class DirectConn:
         self._id += 1
         return self._id
 
-    def cmd(self, tabId, method, params=None):
+    def cmd(self, tabId, method, params=None, profile=None):
+        if profile is not None:
+            die("--profile applies only to the bridge transport; a direct-CDP endpoint is a single browser")
         params = params or {}
         if method == "Meta.listTabs":
             return {"result": {"tabs": [{"tabId": t.get("id"), "url": t.get("url"),
@@ -288,9 +297,12 @@ class _BridgeConn:
                 return None
             self.buf += d
 
-    def cmd(self, tabId, method, params=None):
+    def cmd(self, tabId, method, params=None, profile=None):
         cid = self._next()
-        self._send({"id": cid, "tabId": tabId, "method": method, "params": params or {}})
+        msg = {"id": cid, "tabId": tabId, "method": method, "params": params or {}}
+        if profile is not None:
+            msg["profile"] = profile
+        self._send(msg)
         while True:
             f = self._read_one()
             if f is None:
@@ -303,6 +315,22 @@ class _BridgeConn:
     def send_only(self, tabId, method, params=None):
         cid = self._next()
         self._send({"id": cid, "tabId": tabId, "method": method, "params": params or {}})
+
+    def call_op(self, op, **fields):
+        """Bridge-level op (listProfiles / setLabel): the bridge answers these
+        itself from its connection table; frames carry an id like commands."""
+        cid = self._next()
+        msg = {"op": op, "id": cid}
+        msg.update(fields)
+        self._send(msg)
+        while True:
+            f = self._read_one()
+            if f is None:
+                return {"error": {"message": "connection closed"}}
+            if f.get("id") == cid:
+                return f
+            if f.get("event"):
+                self.evq.append(f)
 
     def subscribe(self, filter=None, tabId=None):
         self._send({"op": "subscribe", "filter": filter or [], "tabId": tabId})
@@ -358,6 +386,66 @@ def Conn(timeout=120):
 def die(msg, code=2):
     print(msg, file=sys.stderr)
     sys.exit(code)
+
+
+# ---- profile targeting (bridge transport) -------------------------------------
+# Labels are Chrome profile directory names ("Profile 1", "Profile 2", ...,
+# "Default") — one vocabulary across the extension, the bridge, and this CLI.
+# Aliases exist only at this CLI edge; anything else must be a directory name.
+PROFILE_ALIASES = {
+    "personal": "Profile 1", "p1": "Profile 1", "1": "Profile 1",
+    "p2": "Profile 2", "2": "Profile 2",
+    "p3": "Profile 3", "3": "Profile 3",
+}
+DEFAULT_PROFILE = "Profile 1"
+
+
+def normalize_profile(value):
+    key = " ".join(str(value).strip().lower().replace("_", " ").split())
+    if key in PROFILE_ALIASES:
+        return PROFILE_ALIASES[key]
+    m = re.fullmatch(r"profile (\d+)", key)
+    if m:
+        return "Profile %s" % m.group(1)
+    if key == "default":
+        return "Default"
+    die("unknown profile %r (use personal, p2, or a directory name like 'Profile 2')" % value)
+
+
+def extract_profile_flag(args):
+    """Pull `--profile <x>` / `--profile=<x>` out of an arg list.
+    Returns (label_or_None, remaining_args)."""
+    out = []
+    label = None
+    i = 0
+    while i < len(args):
+        x = args[i]
+        if x == "--profile":
+            if i + 1 >= len(args):
+                die("--profile needs a value (personal|p2|'Profile 2')")
+            label = normalize_profile(args[i + 1]); i += 2; continue
+        if x.startswith("--profile="):
+            label = normalize_profile(x.split("=", 1)[1]); i += 1; continue
+        out.append(x); i += 1
+    return label, out
+
+
+def _profile_for(conn, explicit, default=None):
+    """Resolve the profile label a command should carry on this connection.
+
+    Profile routing exists only on the bridge transport (the standard
+    /tmp/fcdp.sock bridge), where several labeled profiles share one bridge.
+    The direct-CDP and pipe transports each front a single browser, so an
+    explicit --profile there is a loud error and an absent one sends no
+    profile. On the bridge, an explicit label wins; `default` applies when
+    the caller creates tabs and no label was given.
+    """
+    if isinstance(conn, _BridgeConn) and conn.sock_path == SOCK:
+        return explicit or default
+    if explicit is not None:
+        die("--profile applies only to the bridge transport; "
+            "the direct-CDP and pipe transports drive a single browser")
+    return None
 
 
 def show(r):
@@ -516,11 +604,19 @@ def press_key(conn, tid, name):
 HELP = """fcdp - ONE CLI for your REAL Chrome (our MV3 extension via chrome.debugger)
 
 TABS / NAV:
-  fcdp tabs                       list tabs -> tabId,url,title
-  fcdp open <url> [--bg] [--reuse]  open a NEW tab (cached as active); --bg = background
+  fcdp tabs [--profile <p>]       list tabs -> profile,tabId,url,title
+  fcdp profiles                   list connected profiles (label, conn, tab count)
+  fcdp open <url> [--bg] [--reuse] [--profile <p>]
+                                  open a NEW tab (cached as active); --bg = background
                                   --reuse: if a tab already has this exact url,
                                   Page.navigate it instead of opening a duplicate
                                   (ignored with --bg, which always creates)
+  --profile <p>: personal|p2|'Profile 1'|'Profile 2' — open/tabs target that
+                                  profile; open DEFAULTS to Profile 1.
+                                  TabId commands need no flag: the bridge routes
+                                  each tabId to the profile that owns the tab.
+  fcdp label <conn> <Profile N>   one-time setup: persist a profile label on the
+                                  connection shown by `fcdp profiles`
   fcdp nav [tab] <url>            navigate the tab
   fcdp close [tab]                close the tab
 
@@ -589,24 +685,64 @@ def main():
     c = a[0]
 
     if c == "tabs":
-        conn = Conn(); r = conn.cmd(None, "Meta.listTabs"); conn.close()
+        profile, _rest = extract_profile_flag(a[1:])
+        conn = Conn(); prof = _profile_for(conn, profile)
+        r = conn.cmd(None, "Meta.listTabs", profile=prof); conn.close()
         res = result_or_die(r, "Meta.listTabs")
         for t in res.get("tabs", []):
-            print("%s\t%s\t%s" % (t.get("tabId"), (t.get("url") or "")[:70], (t.get("title") or "")[:40]))
+            print("%s\t%s\t%s\t%s" % (t.get("profile") or "-", t.get("tabId"), (t.get("url") or "")[:70], (t.get("title") or "")[:40]))
         if res.get("attached"):
             print("# attached tabs: %s" % res["attached"], file=sys.stderr)
         return
 
+    if c == "profiles":
+        conn = Conn()
+        if not (isinstance(conn, _BridgeConn) and conn.sock_path == SOCK):
+            conn.close(); die("fcdp profiles applies only to the bridge transport")
+        r = conn.call_op("listProfiles"); conn.close()
+        res = result_or_die(r, "listProfiles")
+        for p in res.get("profiles", []):
+            print("conn %s\t%s\ttabs: %s" % (p.get("conn"), p.get("label") or "(unlabeled)", p.get("tabCount")))
+            for t in p.get("tabSample", []):
+                print("    %s" % (t.get("url") or "")[:90])
+        return
+
+    if c == "label":
+        if len(a) < 3:
+            die("usage: fcdp label <conn> <Profile N>  (conn ids come from `fcdp profiles`)")
+        try:
+            conn_id = int(a[1])
+        except ValueError:
+            die("fcdp label: <conn> must be the numeric connection id from `fcdp profiles`")
+        label = normalize_profile(" ".join(a[2:]))
+        conn = Conn()
+        if not (isinstance(conn, _BridgeConn) and conn.sock_path == SOCK):
+            conn.close(); die("fcdp label applies only to the bridge transport")
+        r = conn.call_op("setLabel", conn=conn_id, label=label); conn.close()
+        show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
+
     if c == "open":
+        profile, rest = extract_profile_flag(a[1:])
         url = None
-        bg = "--bg" in a
-        reuse = "--reuse" in a
-        for x in a[1:]:
+        bg = "--bg" in rest
+        reuse = "--reuse" in rest
+        for x in rest:
             if x not in ("--bg", "--reuse"):
                 url = x; break
         url = url or "about:blank"
         conn = Conn()
-        tabs_before = result_or_die(conn.cmd(None, "Meta.listTabs"), "Meta.listTabs").get("tabs", [])
+        # Deterministic targeting: on the bridge, open ALWAYS names its profile.
+        # The bridge otherwise routes creates to whichever profile was last
+        # active; the default here is Profile 1, never "last active". An
+        # explicit --profile names another profile. Direct-CDP / pipe
+        # transports are single-browser: no profile is sent (an explicit
+        # --profile there dies in _profile_for). All before/after/reuse/anchor
+        # logic below is scoped to the target profile's tabs.
+        prof_arg = _profile_for(conn, profile, DEFAULT_PROFILE)
+        tabs_before = result_or_die(conn.cmd(None, "Meta.listTabs", profile=prof_arg), "Meta.listTabs").get("tabs", [])
         before = {t["tabId"] for t in tabs_before}
         # --reuse: `open` has ALWAYS created a new tab, so an agent that opens the same
         # page across a long session accumulates duplicates monotonically (a real profile
@@ -642,7 +778,7 @@ def main():
                 return
         # Prefer the native chrome.tabs op (active once the extension is reloaded);
         # else fall back to window.open on an existing tab — pure CDP, no reload needed.
-        r = conn.cmd(None, "Meta.createTab", {"url": url, "active": not bg})
+        r = conn.cmd(None, "Meta.createTab", {"url": url, "active": not bg}, profile=prof_arg)
         tid = r.get("result", {}).get("tabId") if isinstance(r, dict) else None
         if not tid:
             # Anchor on a NORMAL page (chrome:// restricts window.open); userGesture beats the popup blocker.
@@ -657,14 +793,14 @@ def main():
             conn.cmd(anchor, "Runtime.evaluate",
                      {"expression": "window.open(%s,'_blank')" % json.dumps(url), "userGesture": True})
             time.sleep(0.8)
-            after = result_or_die(conn.cmd(None, "Meta.listTabs"), "Meta.listTabs").get("tabs", [])
+            after = result_or_die(conn.cmd(None, "Meta.listTabs", profile=prof_arg), "Meta.listTabs").get("tabs", [])
             new = [t for t in after if t["tabId"] not in before]
             tid = new[0]["tabId"] if new else None
         conn.close()
         if not tid:
             die("could not open a new tab")
         save_tab(tid)
-        print("tabId %d (cached active)" % tid)
+        print("tabId %s (cached active)%s" % (tid, (" [%s]" % prof_arg) if prof_arg else ""))
         return
 
     if c in ("attach", "detach"):

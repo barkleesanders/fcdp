@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0
+
+- Added multi-profile control. The extension can be loaded in several Chrome
+  profiles at once; each instance persists a profile label (its Chrome
+  directory name, stored under `fcdpProfileLabel` in chrome.storage.local)
+  and reports it to the bridge on connect, along with a sample of its tabs.
+  The bridge tracks one label per connection and rejects a duplicate claim
+  from a second live connection. Merged tab lists now tag each tab with its
+  owning profile's label.
+- Added `fcdp profiles` (list connected profiles with labels, connection
+  ids, and tab samples) and `fcdp label <conn> <Profile N>` (one-time label
+  setup, persisted by the extension). The extension also answers
+  `Meta.whoami` with its current label.
+- Added `--profile` to `fcdp open` and `fcdp tabs` (aliases: `personal`/`p1`
+  for Profile 1, `p2`, `p3`, or the directory name itself). On the bridge
+  transport, `fcdp open` now defaults deterministically to Profile 1 instead
+  of routing to whichever profile was last active; tabId commands still
+  route to the owning profile automatically. `fcdp tabs` output gained a
+  leading profile column. The direct-CDP and pipe transports reject
+  `--profile` — they drive a single browser.
+- Extension: version 0.2.0; added the `storage` permission, used only to
+  persist the profile label.
+
 ## 2026-08-23
 
 - Added browser-target commands to the existing remote-debugging-port transport.

@@ -87,8 +87,11 @@ fcdp tabs                               # list tabs -> tabId
 ## Commands — ONE tool for everything (tabId optional; omit to use the last `fcdp open`ed tab)
 ```
 # tabs / nav
-fcdp tabs                       list tabs
-fcdp open <url> [--bg]          open a NEW tab (cached active). Uses chrome.tabs after the
+fcdp tabs [--profile <p>]       list tabs (each row tagged with its profile)
+fcdp profiles                   list connected profiles (label, conn, tab count)
+fcdp label <conn> <Profile N>   one-time setup: persist a profile label on a connection
+fcdp open <url> [--bg] [--profile <p>]
+                                open a NEW tab (cached active). Uses chrome.tabs after the
                                 extension is reloaded; else window.open (userGesture) — no reload needed
 fcdp nav  [tab] <url>           Page.navigate
 fcdp close [tab]                close the tab
@@ -123,6 +126,58 @@ the privileged-domain ceiling documented below.
 fcdp raw <tabId> Emulation.setDeviceMetricsOverride '{"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
 fcdp raw <tabId> Runtime.evaluate '{"expression":"navigator.userAgent","returnByValue":true}'
 ```
+
+## Multiple Chrome profiles
+
+The extension can be loaded in more than one Chrome profile at the same time.
+Each profile's instance connects to the same bridge, and the bridge can drive
+tabs in any of them — so a work profile and a personal profile can both be
+scripted without restarting Chrome or moving windows around.
+
+**Set up each profile once:**
+
+1. In the profile's own window, repeat the Load unpacked step from the quick
+   start: chrome://extensions → Developer mode ON → **Load unpacked** → select
+   the same `extension/` folder. (Load it in every profile you want to drive;
+   profiles without the extension are simply not visible to the bridge.)
+2. Run `fcdp profiles`. It lists one row per connected profile — a connection
+   number, its label (or `(unlabeled)`), a tab count, and a sample of its
+   tabs, which is how you tell the connections apart.
+3. Label each connection with its Chrome profile **directory name** — the
+   folder name under Chrome's user-data directory (`Default`, `Profile 1`,
+   `Profile 2`, …):
+
+   ```bash
+   fcdp label 1 "Profile 1"
+   fcdp label 2 "Profile 2"
+   ```
+
+   The label is stored in that profile by the extension itself, so it
+   survives restarts and is reported again on every connect — labeling is a
+   one-time step. The bridge refuses a second live connection claiming a
+   label that is already in use, so a mislabeled profile fails loudly
+   instead of silently receiving another profile's commands.
+
+**Target a profile with `--profile`:**
+
+```bash
+fcdp tabs --profile "Profile 2"     # only that profile's tabs
+fcdp open --profile p2 https://example.com
+```
+
+Values can be the directory name (`"Profile 2"`), the shorthand `p2`, or
+`personal` for Profile 1. Commands that take a tabId (`nav`, `click`, `js`, …)
+need no flag: tab IDs are unique across profiles and the bridge routes each
+one to the profile that owns the tab. `fcdp tabs` with no flag lists every
+profile's tabs merged, each row tagged with its profile label.
+
+**The default is deterministic:** `fcdp open` with no `--profile` always
+creates the tab in **Profile 1** — never in whichever profile's window was
+last active. Name another profile explicitly when you want a different one.
+
+`--profile` applies only to the bridge transport. The direct-CDP and pipe
+transports each front a single browser, so they reject `--profile` instead
+of silently ignoring it.
 
 ### Privileged and browser-level domains
 
