@@ -179,6 +179,21 @@ last active. Name another profile explicitly when you want a different one.
 transports each front a single browser, so they reject `--profile` instead
 of silently ignoring it.
 
+> **Never alias a profile directory.** Do not symlink one profile
+> directory to another name — for example pointing `Default` at
+> `Profile 1` so older scripts that hardcode `Default` keep working.
+> Chrome scans the user-data directory at startup and registers *every*
+> directory it finds there as a separate launchable profile, so an alias
+> mounts the same profile data twice, as two logical profiles sharing one
+> set of files. The symptoms are confusing rather than loud: a profile
+> picker you never enabled, two extension connections claiming the same
+> label (the bridge rejects the duplicate), windows and sessions that
+> look scrambled. If a tool needs a specific profile, pin its real
+> directory name instead (`--profile-directory="Profile 1"`,
+> `fcdp open --profile p1`). This bit us in production on 2026-11-15;
+> the fix was to delete the alias entirely and pin the real name
+> everywhere.
+
 ### Privileged and browser-level domains
 
 Stock Chrome intentionally limits the domains available through the extension

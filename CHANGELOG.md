@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Docs: warn against aliasing profile directories (symlinking `Default`
+  to another profile's directory). Chrome registers every directory in
+  the user-data folder as a separate profile at startup, so an alias
+  dual-mounts one profile's data under two logical profiles — duplicate
+  bridge label claims, a phantom profile picker, scrambled sign-in
+  state. Pin the real directory name instead. Learned in production,
+  2026-11-15.
+
 ## 0.2.0
 
 - Added multi-profile control. The extension can be loaded in several Chrome
