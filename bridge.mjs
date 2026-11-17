@@ -20,8 +20,8 @@
 //     — UNLESS the request carries `profile`, in which case it routes to the
 //     connection that claimed that label, or errors if none did.
 //
-// Profile labels: each extension instance persists a label — its Chrome profile
-// directory name ("Profile 1", "Profile 2", ...) — and reports it in hello. The
+// Profile labels (2026-11-15): each extension instance persists its Chrome
+// directory name ("Profile 1", "Profile 2", ...) and reports it in hello. The
 // bridge records one label per connection and REJECTS a duplicate claim from a
 // second live connection (a mislabeled profile must fail loud, never silently
 // receive another profile's commands). Unlabeled connections serve tab-owned
@@ -43,8 +43,15 @@ import fs from 'node:fs';
 import net from 'node:net';
 import { WebSocketServer } from 'ws';
 
-const PORT = 9871;
-const SOCK = '/tmp/fcdp.sock';
+
+// Profile attestation: enforced by an external guard that runs in a
+// TCC-cleared shell context. This launchd bridge process gets EPERM
+// scanning ~/Library/Application Support, so the bridge does not census
+// profile files itself; the external guard is the hard gate.
+
+const PORT = Number(process.env.FCDP_BRIDGE_PORT || 9871);
+const SOCK = process.env.FCDP_BRIDGE_SOCK || '/tmp/fcdp.sock';
+let ownedSocketInode = null;
 
 const conns = new Set(); // Set<WebSocket> — one per connected profile
 const connTabs = new Map(); // WebSocket -> Set<tabId> owned by that profile
@@ -95,6 +102,10 @@ function defaultConn() {
 
 // ---- extension WebSocket server ------------------------------------------
 const wss = new WebSocketServer({ host: '127.0.0.1', port: PORT });
+wss.on('error', (error) => {
+  console.error(`bridge startup refused on 127.0.0.1:${PORT}: ${error.message}; existing socket untouched`);
+  process.exit(1);
+});
 wss.on('listening', () =>
   log(`bridge WS listening on ws://127.0.0.1:${PORT} (multi-profile; waiting for extensions)`),
 );
@@ -102,6 +113,7 @@ wss.on('connection', (sock) => {
   sock._id = ++connSeq;
   conns.add(sock);
   log(`ext#${sock._id} connected (${conns.size} profile(s) live)`);
+  log('profile attestation: enforced by external guard (bridge has no TCC access to profile files)');
   sock.on('message', (buf) => {
     let msg;
     try {
@@ -232,14 +244,11 @@ function fanoutEvent(msg) {
     const tab = s._fcdpTab;
     if (tab != null && msg.tabId !== tab) continue;
     if (flt?.length && !flt.includes(msg.event)) continue;
-    frameSend(s, { event: msg.event, tabId: msg.tabId, params: msg.params });
+    frameSend(s, { event: msg.event, tabId: msg.tabId, targetId: msg.targetId, params: msg.params });
   }
 }
 
 // ---- Unix-domain server for the CLI --------------------------------------
-try {
-  fs.unlinkSync(SOCK);
-} catch {}
 const unix = net.createServer((sock) => {
   let buf = Buffer.alloc(0);
   sock.on('data', (chunk) => {
@@ -265,7 +274,38 @@ const unix = net.createServer((sock) => {
     subscribers.delete(sock);
   });
 });
-unix.listen(SOCK, () => log(`bridge Unix socket at ${SOCK}`));
+unix.on('error', (error) => {
+  console.error(`bridge Unix socket startup failed: ${error.message}`);
+  process.exit(1);
+});
+// Win the TCP bind before touching the shared Unix pathname. A duplicate
+// daemon must never unlink the socket of the bridge extensions still use.
+wss.once('listening', async () => {
+  try {
+    await new Promise((resolve, reject) => {
+      const probe = net.connect(SOCK);
+      probe.once('connect', () => {
+        probe.destroy();
+        reject(new Error(`a live bridge already owns ${SOCK}`));
+      });
+      probe.once('error', (error) => {
+        if (error.code === 'ENOENT') return resolve();
+        if (error.code !== 'ECONNREFUSED') return reject(error);
+        // Only a proven stale socket may be removed; never a regular file.
+        if (!fs.lstatSync(SOCK).isSocket()) return reject(new Error(`${SOCK} is not a socket`));
+        fs.unlinkSync(SOCK);
+        resolve();
+      });
+    });
+    unix.listen(SOCK, () => {
+      ownedSocketInode = fs.statSync(SOCK).ino;
+      log(`bridge Unix socket at ${SOCK}`);
+    });
+  } catch (error) {
+    console.error(`bridge startup refused: ${error.message}`);
+    process.exit(1);
+  }
+});
 
 function onCliMessage(sock, req) {
   if (req.op === 'subscribe') {
@@ -325,6 +365,14 @@ function onCliMessage(sock, req) {
     return broadcastListTabs(sock, cliId);
   }
 
+  // Child/OOPIF target (no tabId) — route like meta to default profile.
+  if (req.targetId != null && req.tabId == null) {
+    const target = defaultConn();
+    if (!target)
+      return frameSend(sock, { id: cliId, error: { message: 'no connected profile available' } });
+    return relay(target, sock, req);
+  }
+
   // Command targeting a specific tab -> route to the owning profile.
   if (req.tabId != null) {
     const owner = ownerOf(req.tabId);
@@ -359,8 +407,9 @@ function relay(ws, cliSock, req) {
     tabId: req.tabId,
     method: req.method,
   });
+  const payload = { id: extId, tabId: req.tabId, targetId: req.targetId, method: req.method, params: req.params || {} };
   ws.send(
-    JSON.stringify({ id: extId, tabId: req.tabId, method: req.method, params: req.params || {} }),
+    JSON.stringify(payload),
   );
   setTimeout(() => {
     if (pending.has(extId)) {
@@ -397,7 +446,7 @@ function raceRoute(cliSock, req) {
     const extId = nextId++;
     pending.set(extId, { kind: 'race', agg, ws, tabId: req.tabId });
     ws.send(
-      JSON.stringify({ id: extId, tabId: req.tabId, method: req.method, params: req.params || {} }),
+      JSON.stringify({ id: extId, tabId: req.tabId, targetId: req.targetId, method: req.method, params: req.params || {} }),
     );
   }
 }
@@ -411,15 +460,11 @@ function frameSend(sock, obj) {
   } catch {}
 }
 
-process.on('SIGINT', () => {
+function shutdown() {
   try {
-    fs.unlinkSync(SOCK);
+    if (ownedSocketInode !== null && fs.lstatSync(SOCK).ino === ownedSocketInode) fs.unlinkSync(SOCK);
   } catch {}
   process.exit(0);
-});
-process.on('SIGTERM', () => {
-  try {
-    fs.unlinkSync(SOCK);
-  } catch {}
-  process.exit(0);
-});
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

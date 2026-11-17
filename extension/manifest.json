@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "fcdp — Full CDP Bridge",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Exposes the full Chrome DevTools Protocol on this profile via chrome.debugger, bridged to a local daemon.",
   "permissions": ["debugger", "tabs", "alarms", "storage"],
   "host_permissions": ["<all_urls>"],

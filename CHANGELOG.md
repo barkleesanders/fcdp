@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.2 — 2026-11-16
+
+Sync of the production code back into the public repo (the live install
+had moved ahead of the 0.2.0 port). Extension version bumped to 0.2.2.
+
+- Extension: OOPIF / child-target routing. Bridge requests may now carry
+  a `targetId` (Stripe Elements / Shopify PCI iframes, workers); the
+  extension sends on the child target directly, attaches on demand, and
+  falls back to `chrome.debugger.getTargets()`. CDP events forwarded to
+  the bridge now include `targetId`.
+- Extension: create-time navigation guard. Chrome intermittently drops a
+  background tab's create-time navigation, leaving an uncommitted tab
+  that fails downstream with a misleading chrome-extension:// error.
+  `Meta.createTab` now waits for the commit, heals via `chrome.tabs.update`
+  and then CDP `Page.navigate` (worst case ~38s, inside the bridge's 60s
+  reply timeout), and reports `{committed, healed}` on the result; the
+  CLI surfaces a healed or uncommitted create in its output. Tab creation
+  is error-checked, with a `chrome.windows.create` fallback when no
+  window exists.
+- Extension: new `Meta.navigateTab` op — debugger-free navigation via
+  `chrome.tabs.update`, the heal for a tab whose navigation never
+  committed.
+- Bridge: socket/startup hardening. The WebSocket port and Unix socket
+  path are configurable (`FCDP_BRIDGE_PORT` / `FCDP_BRIDGE_SOCK`). A
+  failed WS bind exits without touching the existing socket; the bridge
+  wins the TCP bind before touching the Unix pathname and only unlinks a
+  proven-stale socket (never a live bridge's socket or a regular file);
+  shutdown removes the socket only if it still owns it (inode-checked).
+  Child-target requests (targetId, no tabId) route to the default
+  profile.
+- CLI: new `snap` command — compact a11y-style `@N` refs for agents,
+  persisted per tab so `click @N` / `fill @N` can act on the stamped
+  nodes (DOM click with coordinate fallback). New `viewport` command
+  (`Emulation.setDeviceMetricsOverride`, default 1440x900) and `tabsnav`
+  (navigate via `Meta.navigateTab`). `fill` no longer echoes filled
+  values (password-safe). The :9222 autodetect fallback at startup is
+  removed: with no bridge socket and no explicit transport pinned, the
+  CLI refuses to attach to a debug-port browser and fails loud instead
+  of silently driving the wrong Chrome.
+
 ## 0.2.1
 
 - Docs: warn against aliasing profile directories (symlinking `Default`

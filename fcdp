@@ -16,7 +16,7 @@ tabId is OPTIONAL on every command: `fcdp open <url>` caches the new tab in
 ~/.cache/fcdp-tab; omit tabId to use it, or pass it explicitly as the first arg.
 
 Wire to the bridge (/tmp/fcdp.sock): 4-byte LE length prefix + JSON.
-  request : {id, tabId, method, params, profile?}
+  request : {id, tabId, method, params, profile?, targetId?}
             or  {op:"subscribe"|"listProfiles"|"setLabel", ...}
   reply   : {id, result|error}            events pushed as {event, tabId, params}
 """
@@ -73,11 +73,15 @@ def _autodetect_cdp():
 # tabId syntax differs per transport (bridge = chrome.tabs ints, direct = hex target
 # ids) and resolve_tid() runs long before the first Conn() is built.
 if not CDP_URL and not PIPE_SOCKET and not os.path.exists(SOCK):
-    _found = _autodetect_cdp()
-    if _found:
-        CDP_URL = _found
-        print("fcdp: no bridge socket; using direct CDP at %s (set FCDP_CDP_URL to pin it)"
-              % _found, file=sys.stderr)
+    # The _autodetect_cdp() fallback was REMOVED (2026-11-09). Silently
+    # attaching to whatever listens on :9222 landed lanes in a headless
+    # debug-port Chrome instead of the user's real browser. With no bridge
+    # socket and no explicit transport pinned, stay in
+    # bridge mode: Conn fails loud ("bridge unavailable -- refusing to attach
+    # to a debug-port browser"). A lane whose OWN notes name a debug-port
+    # instance as its exception pins FCDP_CDP_URL explicitly -- that still works.
+    print("fcdp: bridge socket %s not found and no explicit transport pinned; "
+          "refusing to attach to a debug-port browser" % SOCK, file=sys.stderr)
 
 # A bridge tab id is a chrome.tabs integer; a direct target id is an unrelated hex
 # string. Reusing one cache file made switching transports silently aim a command at
@@ -265,7 +269,7 @@ class _BridgeConn:
     def __init__(self, timeout=120, sock_path=SOCK):
         self.sock_path = sock_path
         if not os.path.exists(sock_path):
-            die("bridge socket %s not found — is its bridge running?" % sock_path)
+            die("bridge unavailable -- refusing to attach to a debug-port browser (bridge socket %s not found; restart it: launchctl kickstart -k gui/$(id -u)/com.barklee.fcdp-bridge; the 9222 autodetect fallback was removed 2026-11-09)" % sock_path)
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.s.settimeout(timeout)
         try:
@@ -297,9 +301,13 @@ class _BridgeConn:
                 return None
             self.buf += d
 
-    def cmd(self, tabId, method, params=None, profile=None):
+    def cmd(self, tabId, method, params=None, targetId=None, profile=None):
         cid = self._next()
-        msg = {"id": cid, "tabId": tabId, "method": method, "params": params or {}}
+        msg = {"id": cid, "method": method, "params": params or {}}
+        if targetId is not None:
+            msg["targetId"] = targetId
+        if tabId is not None:
+            msg["tabId"] = tabId
         if profile is not None:
             msg["profile"] = profile
         self._send(msg)
@@ -617,19 +625,25 @@ TABS / NAV:
                                   each tabId to the profile that owns the tab.
   fcdp label <conn> <Profile N>   one-time setup: persist a profile label on the
                                   connection shown by `fcdp profiles`
-  fcdp nav [tab] <url>            navigate the tab
+  fcdp nav [tab] <url>            navigate the tab (CDP Page.navigate)
+  fcdp tabsnav [tab] <url>        navigate via chrome.tabs.update (debugger-free; heals a tab whose create-time navigation never committed)
   fcdp close [tab]                close the tab
 
 READ:
   fcdp read [tab]                 interactive-element outline (role/text/coords) + title/url
+  fcdp snap [tab] [--max N]       compact a11y-style refs for agents (@1..@N); token-cheap
   fcdp text [tab]                 page innerText
   fcdp find [tab] "<css|text>"    matching elements -> tag,text,center x,y
   fcdp shot [tab] [file.png]      screenshot (Page.captureScreenshot)
 
+AGENT HARNESS (Aside-inspired; still CDP under the hood — no Playwright):
+  fcdp viewport [tab] [W H]       lock agent viewport (default 1440 900); use on --bg tabs
+  Prefer: open --bg → viewport → snap → click/fill @N → close. Keep raw CDP for ops/debug.
+
 INTERACT:
-  fcdp click [tab] <css|text|x,y> click an element (by selector/visible-text) or coords
+  fcdp click [tab] <css|text|x,y|@N>  click by selector/text/coords OR snap ref (@3)
   fcdp type [tab] "<text>"        type at the focused element (Input.insertText)
-  fcdp fill [tab] <css> "<value>" set an input's value (React-safe) by selector
+  fcdp fill [tab] <css|@N> "<value>"  set input value by selector OR snap ref
   fcdp key  [tab] <Key>           press a key (Enter, Tab, Escape, ArrowDown, ...)
   fcdp scroll [tab] <up|down|left|right> [n]
   fcdp js  [tab] "<code>"         Runtime.evaluate (returnByValue, awaitPromise)
@@ -675,6 +689,51 @@ for(var i=0;i<all.length&&out.length<80;i++){var el=all[i];var r=el.getBoundingC
 var t=(el.getAttribute('aria-label')||el.textContent||el.value||el.placeholder||'').trim().slice(0,60);
 out.push(el.tagName.toLowerCase()+(el.type?('['+el.type+']'):'')+' "'+t+'" @'+Math.round(r.left+r.width/2)+','+Math.round(r.top+r.height/2));}
 return {title:document.title,url:location.href,interactive:out};})()"""
+
+
+
+_SNAP = r"""(function(maxN){maxN=maxN||40;
+document.querySelectorAll('[data-fcdp-ref]').forEach(function(el){ el.removeAttribute('data-fcdp-ref'); });
+var sels='a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=textbox],[role=combobox],[onclick],[contenteditable=true]';
+var all=document.querySelectorAll(sels);
+var items=[], seen={};
+function roleOf(el){
+  var r=el.getAttribute('role'); if(r) return r;
+  var t=el.tagName.toLowerCase();
+  if(t==='a') return 'link';
+  if(t==='button') return 'button';
+  if(t==='select') return 'combobox';
+  if(t==='textarea') return 'textbox';
+  if(t==='input'){ var ty=(el.type||'text').toLowerCase();
+    if(ty==='checkbox'||ty==='radio') return ty;
+    if(ty==='submit'||ty==='button') return 'button';
+    return 'textbox'; }
+  return t;
+}
+function labelOf(el){
+  var t=(el.getAttribute('aria-label')||el.getAttribute('placeholder')||el.getAttribute('name')||el.getAttribute('title')||'');
+  if(!t){ var id=el.id; if(id){ try{ var lab=document.querySelector('label[for="'+String(id).replace(/"/g,'\\"')+'"]'); if(lab) t=lab.textContent||''; }catch(e){} } }
+  if(!t) t=el.textContent||el.value||'';
+  return String(t).replace(/\s+/g,' ').trim().slice(0,48);
+}
+for(var i=0;i<all.length && items.length<maxN;i++){
+  var el=all[i];
+  var r=el.getBoundingClientRect();
+  if(r.width<2||r.height<2) continue;
+  if(r.bottom<0||r.top>(innerHeight||0)||r.right<0||r.left>(innerWidth||0)) continue;
+  var st=getComputedStyle(el); if(st.visibility==='hidden'||st.display==='none'||Number(st.opacity)===0) continue;
+  var key=el.tagName+'|'+Math.round(r.left)+'|'+Math.round(r.top)+'|'+labelOf(el);
+  if(seen[key]) continue; seen[key]=1;
+  var ref=items.length+1;
+  el.setAttribute('data-fcdp-ref', String(ref));
+  items.push({ref:ref, role:roleOf(el), name:labelOf(el), tag:el.tagName.toLowerCase(),
+    type:el.type||null, focused:(document.activeElement===el),
+    x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2),
+    w:Math.round(r.width), h:Math.round(r.height)});
+}
+window.__fcdpSnap={at:Date.now(), url:location.href, items:items};
+return {title:document.title, url:location.href, count:items.length, items:items};
+})"""
 
 
 def main():
@@ -799,6 +858,12 @@ def main():
         conn.close()
         if not tid:
             die("could not open a new tab")
+        # Surface the extension's create-time navigation guard (2026-11-11):
+        # a healed or still-uncommitted create must be visible in job logs,
+        # never a silent doomed tab.
+        _res = r.get("result", {}) if isinstance(r, dict) else {}
+        if _res.get("committed") is not None and (_res.get("healed") not in (None, "none") or _res.get("committed") is False):
+            print("# fcdp create-guard: committed=%s healed=%s" % (_res.get("committed"), _res.get("healed")), file=sys.stderr)
         save_tab(tid)
         print("tabId %s (cached active)%s" % (tid, (" [%s]" % prof_arg) if prof_arg else ""))
         return
@@ -865,6 +930,21 @@ def main():
         r = conn.cmd(tid, "Page.navigate", {"url": rest[0]}); conn.close()
         save_tab(tid); show(r); return
 
+    if c == "tabsnav":
+        # Debugger-free navigation (extension Meta.navigateTab ->
+        # chrome.tabs.update). The heal for a tab whose create-time
+        # navigation never committed: Runtime.evaluate cannot run on an
+        # uncommitted tab and Page.navigate needs a live debugger target;
+        # tabs.update needs neither.
+        tid, rest = resolve_tid(a, 1)
+        if not rest:
+            die("usage: fcdp tabsnav [tab] <url>")
+        conn = Conn(); r = conn.cmd(tid, "Meta.navigateTab", {"url": rest[0]}); conn.close()
+        save_tab(tid); show(r)
+        if isinstance(r, dict) and r.get("error"):
+            sys.exit(1)
+        return
+
     if c == "text":
         tid, _ = resolve_tid(a, 1)
         conn = Conn()
@@ -882,6 +962,46 @@ def main():
             print("  " + line)
         return
 
+    if c == "snap":
+        # Compact agent-facing snapshot (Aside-style refs) without Playwright.
+        tid, rest = resolve_tid(a, 1)
+        max_n = 40
+        if "--max" in rest:
+            i = rest.index("--max")
+            if i + 1 >= len(rest):
+                die("usage: fcdp snap [tab] [--max N]")
+            max_n = int(rest[i + 1])
+        conn = Conn()
+        v = evalv(conn, tid, _SNAP + "(%d)" % max_n)
+        conn.close()
+        if not isinstance(v, dict):
+            die("snap failed: %s" % json.dumps(v)[:300])
+        # Persist refs for click/fill @N (survives across CLI invocations)
+        snap_path = "/tmp/fcdp-snap-%s.json" % tid
+        json.dump({"tid": tid, "url": v.get("url"), "items": v.get("items") or []}, open(snap_path, "w"))
+        print("%s" % v.get("title"))
+        print("%s" % v.get("url"))
+        print("# %d refs  (click/fill @N)  saved %s" % (v.get("count") or 0, snap_path))
+        for it in (v.get("items") or []):
+            focus = "*" if it.get("focused") else " "
+            name = (it.get("name") or "").replace("\n", " ")
+            print("@%d%s %s %s" % (it["ref"], focus, it.get("role") or "?", name))
+        return
+
+    if c == "viewport":
+        # Lock agent viewport (Aside uses 1440x900 for CUA/training alignment).
+        tid, rest = resolve_tid(a, 1)
+        w = int(rest[0]) if len(rest) >= 1 else 1440
+        h = int(rest[1]) if len(rest) >= 2 else 900
+        conn = Conn()
+        r = conn.cmd(tid, "Emulation.setDeviceMetricsOverride", {
+            "width": w, "height": h, "deviceScaleFactor": 1, "mobile": False,
+        })
+        conn.close()
+        result_or_die(r, "Emulation.setDeviceMetricsOverride")
+        print("viewport %dx%d on tab %s" % (w, h, tid))
+        return
+
     if c == "find":
         tid, rest = resolve_tid(a, 1)
         if not rest:
@@ -893,13 +1013,37 @@ def main():
     if c == "click":
         tid, rest = resolve_tid(a, 1)
         if not rest:
-            die('usage: fcdp click [tab] <css|text|x,y>')
+            die('usage: fcdp click [tab] <css|text|x,y|@N>')
         arg = " ".join(rest)
         conn = Conn()
         m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*", arg)
         if m:
             click_at(conn, tid, int(m.group(1)), int(m.group(2)))
             conn.close(); print("clicked %s,%s" % (m.group(1), m.group(2))); return
+        mref = re.fullmatch(r"\s*@(\d+)\s*", arg)
+        if mref:
+            snap_path = "/tmp/fcdp-snap-%s.json" % tid
+            try:
+                snap = json.load(open(snap_path))
+            except Exception:
+                conn.close(); die("no snap for tab %s — run: fcdp snap %s" % (tid, tid))
+            ref = int(mref.group(1))
+            it = next((x for x in snap.get("items") or [] if x.get("ref") == ref), None)
+            if not it:
+                conn.close(); die("unknown ref @%d (snap has %d)" % (ref, len(snap.get("items") or [])))
+            # Prefer DOM click on stamped node (works on --bg tabs); coords as fallback.
+            hit = evalv(conn, tid, """(function(ref){var el=document.querySelector('[data-fcdp-ref="'+ref+'"]');
+if(!el) return {ok:false,err:'missing stamp'}; el.scrollIntoView({block:'center'});
+if(typeof el.click==='function') el.click();
+return {ok:true,tag:el.tagName,href:el.href||null,name:(el.getAttribute('aria-label')||el.textContent||'').trim().slice(0,60)};})(%d)""" % ref)
+            if not (isinstance(hit, dict) and hit.get("ok")):
+                click_at(conn, tid, int(it["x"]), int(it["y"]))
+                conn.close()
+                print("clicked @%d %s \"%s\" @%d,%d (coord-fallback)" % (ref, it.get("role"), it.get("name"), it["x"], it["y"]))
+                return
+            conn.close()
+            print("clicked @%d %s \"%s\"%s" % (ref, it.get("role"), it.get("name"), (" -> "+hit["href"]) if hit.get("href") else ""))
+            return
         ctr = evalv(conn, tid, _CENTER + "(" + json.dumps(arg) + ")")
         if not ctr:
             conn.close(); die("no element matched: %s" % arg)
@@ -915,11 +1059,33 @@ def main():
     if c == "fill":
         tid, rest = resolve_tid(a, 1)
         if len(rest) < 2:
-            die('usage: fcdp fill [tab] <css> "<value>"')
+            die('usage: fcdp fill [tab] <css|@N> "<value>"')
         sel = rest[0]; val = " ".join(rest[1:])
         conn = Conn()
+        mref = re.fullmatch(r"@(\d+)", sel)
+        if mref:
+            snap_path = "/tmp/fcdp-snap-%s.json" % tid
+            try:
+                snap = json.load(open(snap_path))
+            except Exception:
+                conn.close(); die("no snap for tab %s — run: fcdp snap %s" % (tid, tid))
+            ref = int(mref.group(1))
+            it = next((x for x in snap.get("items") or [] if x.get("ref") == ref), None)
+            if not it:
+                conn.close(); die("unknown ref @%d" % ref)
+            v = evalv(conn, tid, """(function(ref,val){var el=document.querySelector('[data-fcdp-ref="'+ref+'"]');
+if(!el) return {ok:false,err:'missing stamp'};
+el.focus(); var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+var setter=Object.getOwnPropertyDescriptor(proto,'value'); if(setter&&setter.set){setter.set.call(el,val);} else {el.value=val;}
+el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));
+return {ok:true,tag:el.tagName,ref:Number(ref)};})(%s,%s)""" % (json.dumps(str(ref)), json.dumps(val)))
+            conn.close()
+            print(json.dumps({"ok": bool(isinstance(v, dict) and v.get("ok")), "ref": ref, "chars": len(val)})); return
         v = evalv(conn, tid, _FILL + "(" + json.dumps(sel) + "," + json.dumps(val) + ")")
         conn.close()
+        # Never echo filled values (password-safe)
+        if isinstance(v, dict) and "value" in v:
+            v = {k: v[k] for k in v if k != "value"}; v["chars"] = len(val)
         print(json.dumps(v)); return
 
     if c == "key":
@@ -970,7 +1136,7 @@ def main():
 
     if c == "pdf":
         tid, rest = resolve_tid(a, 1)
-        out = rest[0] if rest else "/tmp/fcdp-%d.pdf" % tid
+        out = rest[0] if rest else "/tmp/fcdp-%s.pdf" % tid
         conn = Conn(); conn.cmd(tid, "Page.enable")
         r = conn.cmd(tid, "Page.printToPDF", {"printBackground": True, "landscape": False}); conn.close()
         res = result_or_die(r, "Page.printToPDF")
@@ -1113,11 +1279,11 @@ def main():
             "offline": False, "latency": 400,
             "downloadThroughput": int(400 * 1024 / 8), "uploadThroughput": int(400 * 1024 / 8),
             "connectionType": "cellular3g"}); conn.close()
-        show(r); print("# applied Slow-3G to tab %d" % tid, file=sys.stderr); return
+        show(r); print("# applied Slow-3G to tab %s" % tid, file=sys.stderr); return
 
     if c == "trace":
         tid, rest = resolve_tid(a, 1)
-        out = rest[0] if rest else "/tmp/fcdp-trace-%d.json" % tid
+        out = rest[0] if rest else "/tmp/fcdp-trace-%s.json" % tid
         conn = Conn()
         conn.subscribe(filter=["Tracing.dataCollected", "Tracing.tracingComplete"], tabId=tid)
         result_or_die(conn.cmd(tid, "Tracing.start", {"transferMode": "ReportEvents"}), "Tracing.start")

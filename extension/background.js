@@ -1,3 +1,4 @@
+// OOPIF-targetId-v3
 // fcdp background service worker (MV3).
 // Connects OUT to the local bridge daemon over ws://127.0.0.1:<PORT>, then for
 // each request runs (most of) the Chrome DevTools Protocol via chrome.debugger —
@@ -17,13 +18,13 @@
 //                   {event:"Domain.method", tabId, params} CDP event (unsolicited)
 //                   {hello:true, profileLabel, tabSample, attached}  on (re)connect
 //
-// Multi-profile identity: the SAME extension can be loaded in several Chrome
-// profiles at once. Each profile's instance persists a label — its Chrome
-// profile directory name ("Profile 1", "Profile 2", ...) — in
-// chrome.storage.local, set once at install time via Meta.setProfileLabel
-// (see `fcdp label`), and reports it in hello so the bridge can route
-// profile-targeted commands deterministically. Unlabeled instances still
-// serve tab-owned commands, but are never chosen as a profile target.
+// Multi-profile identity (2026-11-15): the SAME extension is loaded in several
+// Chrome profiles. Each profile's instance persists its Chrome directory name
+// ("Profile 1", "Profile 2", ...) as a label in chrome.storage.local — set once
+// at install time via Meta.setProfileLabel (see `fcdp label`) — and reports it
+// in hello so the bridge can route profile-targeted commands deterministically.
+// Unlabeled instances still work for tab-owned commands, but are never chosen
+// as a default or profile target.
 
 const PORT = 9871;
 const URL = "ws://127.0.0.1:" + PORT;
@@ -56,7 +57,7 @@ async function sendHello() {
   try {
     const tabs = await new Promise((res) => chrome.tabs.query({}, res));
     tabSample = (tabs || []).slice(0, 5).map((t) => ({ url: t.url, title: t.title, windowId: t.windowId }));
-  } catch (e) { /* sample helps the operator tell profiles apart; never load-bearing */ }
+  } catch (e) { /* sample is evidence for the operator, never load-bearing */ }
   send({ hello: true, profileLabel, tabSample, attached: [...attached] });
 }
 
@@ -93,9 +94,10 @@ async function ensureAttached(tabId) {
   }).then((r) => { if (r && r.error) throw new Error(r.error); });
 }
 
-function sendCommand(tabId, method, params) {
+function sendCommand(debuggee, method, params) {
+  // debuggee: { tabId } or { targetId } (OOPIF / worker child targets)
   return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
+    chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       const err = chrome.runtime.lastError;
       if (err) return reject(new Error(err.message));
       resolve(result);
@@ -103,12 +105,8 @@ function sendCommand(tabId, method, params) {
   });
 }
 
-// A CDP command can fail transiently when the debugger silently lost the tab (renderer
-// swap, a brief chrome-extension:// URL, another debugger extension touching the tab).
-// The cure is always the same: force a clean detach+reattach and retry ONCE. This is
-// what Claude-for-Chrome's own CDP driver does inside every sendCommand (RE'd 2026-07-12,
-// ext fcoeoabgfenejglbffodgkkbkcdhcgfn) — it turns the manual `fcdp detach <tab>` dance
-// into something the bridge handles itself.
+// A tab command can fail transiently after a renderer swap or debugger detach.
+// Force one clean reattach and retry once; targetId commands have their own path.
 const TRANSIENT_CDP = [
   "debugger is not attached",
   "detached while handling command",
@@ -116,15 +114,114 @@ const TRANSIENT_CDP = [
 ];
 async function sendCommandWithRetry(tabId, method, params) {
   try {
-    return await sendCommand(tabId, method, params);
+    return await sendCommand({ tabId }, method, params);
   } catch (e) {
     const msg = ((e && e.message) || String(e)).toLowerCase();
-    if (!TRANSIENT_CDP.some((s) => msg.includes(s))) throw e;
-    // clean-slate reattach, then retry exactly once
+    if (!TRANSIENT_CDP.some((text) => msg.includes(text))) throw e;
     attached.delete(tabId);
-    await new Promise((res) => chrome.debugger.detach({ tabId }, () => { chrome.runtime.lastError; res(); }));
+    await new Promise((resolve) => {
+      chrome.debugger.detach({ tabId }, () => {
+        chrome.runtime.lastError;
+        resolve();
+      });
+    });
     await ensureAttached(tabId);
-    return await sendCommand(tabId, method, params);
+    return await sendCommand({ tabId }, method, params);
+  }
+}
+
+// --- create-time navigation guard (2026-11-11) ---
+// Chrome intermittently DROPS a background tab's create-time navigation:
+// chrome.tabs.create returns a tab whose url stays "" indefinitely — every
+// downstream wait then times out and Runtime.evaluate on the uncommitted tab
+// surfaces as "Cannot access a chrome-extension:// URL of different
+// extension" (the tab has no committed document of its own yet). This was
+// a portal-watch failure mode seen in production. Guard every create: wait for
+// the commit, heal first via chrome.tabs.update (tabs API — works with no
+// renderer/debugger), then via CDP Page.navigate, and report the outcome
+// on the create result as {committed, healed} so callers can see it.
+function getTabAsync(tabId) {
+  return new Promise((res) => chrome.tabs.get(tabId, (t) => { chrome.runtime.lastError; res(t || null); }));
+}
+async function waitCommit(tabId, ms) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const t = await getTabAsync(tabId);
+    if (!t) return null; // tab is gone
+    if (t.url) return t; // committed (any non-empty url)
+    if (Date.now() >= deadline) return t;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+async function guardCreateNavigation(tabId, url) {
+  // HARD BUDGET: the bridge synthesizes "timeout waiting for extension
+  // reply" at 60s, so the whole ladder must finish well inside that —
+  // including a debugger attach that stalls on a stuck renderer (raced
+  // at 8s below). Worst case here is ~38s of waits plus poll overhead.
+  let healed = "none";
+  let t = await waitCommit(tabId, 12000);
+  if (!t) return { committed: false, healed, gone: true };
+  if (t.url) return { committed: true, healed };
+  healed = "tabs.update";
+  await new Promise((res) => chrome.tabs.update(tabId, { url }, () => { chrome.runtime.lastError; res(); }));
+  t = await waitCommit(tabId, 10000);
+  if (t && t.url) return { committed: true, healed };
+  healed = "page.navigate";
+  try {
+    await Promise.race([
+      (async () => {
+        await ensureAttached(tabId);
+        await sendCommand({ tabId }, "Page.navigate", { url });
+      })(),
+      new Promise((r) => setTimeout(r, 8000)),
+    ]);
+  } catch (e) { /* fall through to the final check */ }
+  t = await waitCommit(tabId, 8000);
+  return { committed: !!(t && t.url), healed };
+}
+
+const attachedTargets = new Set(); // targetIds we've attached to (OOPIFs)
+
+async function ensureAttachedTarget(targetId) {
+  if (attachedTargets.has(targetId)) return;
+  await new Promise((res, rej) => {
+    chrome.debugger.attach({ targetId }, DBG_VERSION, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        // Already attached via Target.setAutoAttach (flatten) — treat as ok.
+        const msg = err.message || "";
+        if (/already attached|Another debugger|attached to the target/i.test(msg)) {
+          attachedTargets.add(targetId);
+          return res();
+        }
+        return rej(new Error(msg));
+      }
+      attachedTargets.add(targetId);
+      res();
+    });
+  });
+}
+
+async function sendCommandOnTarget(targetId, method, params) {
+  // Flatten auto-attach sessions are addressable by targetId WITHOUT a second
+  // chrome.debugger.attach — attach often returns "No target with given id".
+  // Try send first; only attach if send says we must.
+  try {
+    return await sendCommand({ targetId }, method, params);
+  } catch (e1) {
+    const m1 = (e1 && e1.message) || String(e1);
+    if (!/No target|not attached|Detached|debugger/i.test(m1)) throw e1;
+    try {
+      await ensureAttachedTarget(targetId);
+      return await sendCommand({ targetId }, method, params);
+    } catch (e2) {
+      // Last resort: chrome.debugger.getTargets() and match id
+      const targets = await new Promise((res) => chrome.debugger.getTargets(res));
+      const hit = (targets || []).find((t) => t.id === targetId);
+      if (!hit) throw e2;
+      await ensureAttachedTarget(targetId);
+      return await sendCommand({ targetId }, method, params);
+    }
   }
 }
 
@@ -132,7 +229,7 @@ async function handle(data) {
   let msg;
   try { msg = JSON.parse(data); } catch { return; }
   if (msg.ping) { return; } // keepalive from bridge; presence is enough
-  const { id, tabId, method, params } = msg;
+  const { id, tabId, targetId, method, params } = msg;
   if (id == null) return;
 
   try {
@@ -168,13 +265,63 @@ async function handle(data) {
     }
     if (method === "Meta.createTab") {
       const p = params || {};
-      const tab = await new Promise((res) => chrome.tabs.create({ url: p.url || "about:blank", active: p.active !== false }, res));
-      return send({ id, result: { tabId: tab.id, url: tab.url, windowId: tab.windowId } });
+      const url = p.url || "about:blank";
+      const active = p.active !== false;
+      const tab = await new Promise((res, rej) => {
+        chrome.tabs.create({ url, active }, (created) => {
+          const err = chrome.runtime.lastError;
+          if (err) return rej(new Error(err.message));
+          if (created && created.id != null) return res(created);
+          // Chrome returns undefined when there is no window to attach a tab to.
+          chrome.windows.create({ url, focused: active, type: "normal" }, (win) => {
+            const werr = chrome.runtime.lastError;
+            if (werr) return rej(new Error(werr.message));
+            const createdTab = win && win.tabs && win.tabs[0];
+            if (!createdTab || createdTab.id == null) {
+              return rej(new Error("chrome_window_missing"));
+            }
+            res(createdTab);
+          });
+        });
+      });
+      let guard = null;
+      if (p.url) {
+        try { guard = await guardCreateNavigation(tab.id, url); }
+        catch (e) { guard = { committed: false, healed: "error", error: (e && e.message) || String(e) }; }
+      }
+      const finalTab = guard ? await getTabAsync(tab.id) : tab;
+      return send({ id, result: {
+        tabId: tab.id,
+        url: (finalTab && finalTab.url) || tab.url,
+        windowId: tab.windowId,
+        committed: guard ? guard.committed : undefined,
+        healed: guard ? guard.healed : undefined,
+      } });
+    }
+    if (method === "Meta.navigateTab") {
+      // Debugger-free navigation via the tabs API — the heal for a tab
+      // whose navigation never committed (Runtime.evaluate and CDP both
+      // need a live target; chrome.tabs.update does not).
+      const p = params || {};
+      if (tabId == null || !p.url) throw new Error("Meta.navigateTab requires tabId and params.url");
+      const updated = await new Promise((res, rej) => {
+        chrome.tabs.update(tabId, { url: p.url }, (t) => {
+          const err = chrome.runtime.lastError;
+          if (err) return rej(new Error(err.message));
+          res(t);
+        });
+      });
+      return send({ id, result: { navigated: true, tabId, url: updated && updated.url } });
     }
     if (method === "Meta.closeTab") {
       await new Promise((res) => chrome.tabs.remove(tabId, () => { chrome.runtime.lastError; res(); }));
       attached.delete(tabId);
       return send({ id, result: { closed: true, tabId } });
+    }
+    // OOPIF / child target command (Shopify PCI, Stripe Elements, etc.)
+    if (targetId) {
+      const result = await sendCommandOnTarget(targetId, method, params);
+      return send({ id, result });
     }
     // Default: a raw CDP command on a tab.
     if (tabId == null) throw new Error("tabId required for CDP command " + method);
@@ -189,7 +336,7 @@ async function handle(data) {
 // Forward ALL CDP events to the bridge so the CLI can observe them
 // (Fetch.requestPaused, Tracing.dataCollected, Network.*, ...).
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  send({ event: method, tabId: source.tabId, params });
+  send({ event: method, tabId: source.tabId, targetId: source.targetId, params });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
